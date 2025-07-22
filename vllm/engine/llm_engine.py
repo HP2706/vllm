@@ -403,6 +403,8 @@ class LLMEngine:
         # Mapping from a request id to the id of another request that must
         # finish before this request can start.
         self.sync_dependencies: Dict[str, str] = {}
+        # Requests that have been paused waiting on another request to finish.
+        self.paused_requests: Dict[str, SequenceGroup] = {}
 
         # Flag to set when an input fails to process and the engine should run
         # the next step without re-scheduling.
@@ -873,6 +875,31 @@ class LLMEngine:
             return
 
         self._add_processed_request(*args)
+
+    def pause_request(self, request_id: str, wait_on: str) -> None:
+        """Pause an in-flight request until another request finishes."""
+        seq_group = self.request_id_to_seq_group.get(request_id)
+        if seq_group is None:
+            raise ValueError(f"unknown request {request_id}")
+
+        for scheduler in self.scheduler:
+            for queue in (scheduler.waiting, scheduler.running,
+                          scheduler.swapped):
+                if seq_group in queue:
+                    queue.remove(seq_group)
+                    break
+
+        self.paused_requests[request_id] = seq_group
+        self.sync_dependencies[request_id] = wait_on
+
+    def transfer_request(self, request_id: str, new_request_id: str) -> None:
+        """Rename a request id, transferring its state."""
+        seq_group = self.request_id_to_seq_group.pop(request_id, None)
+        if seq_group is None:
+            raise ValueError(f"unknown request {request_id}")
+
+        seq_group.request_id = new_request_id
+        self.request_id_to_seq_group[new_request_id] = seq_group
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.
@@ -1385,6 +1412,11 @@ class LLMEngine:
                     args = self.pending_requests.pop(rid, None)
                     if args is not None:
                         self._add_processed_request(*args)
+                    else:
+                        seq_group = self.paused_requests.pop(rid, None)
+                        if seq_group is not None:
+                            self.scheduler[virtual_engine].add_seq_group(
+                                seq_group)
                     del self.sync_dependencies[rid]
 
             # Maybe switch from async mode to sync mode
