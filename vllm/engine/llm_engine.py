@@ -394,6 +394,15 @@ class LLMEngine:
             ))
 
         self.seq_id_to_seq_group: Dict[str, SequenceGroupBase] = {}
+        # Mapping from request id to its sequence group for quick lookup.
+        self.request_id_to_seq_group: Dict[str, SequenceGroup] = {}
+        # Requests that are pending on other requests to finish before being
+        # scheduled.  Each entry maps the request id to the request arguments
+        # used for :meth:`add_request`.
+        self.pending_requests: Dict[str, tuple] = {}
+        # Mapping from a request id to the id of another request that must
+        # finish before this request can start.
+        self.sync_dependencies: Dict[str, str] = {}
 
         # Flag to set when an input fails to process and the engine should run
         # the next step without re-scheduling.
@@ -622,6 +631,8 @@ class LLMEngine:
         ]
         min_cost_scheduler = self.scheduler[costs.index(min(costs))]
         min_cost_scheduler.add_seq_group(seq_group)
+        # Track the sequence group by request id for future lookup.
+        self.request_id_to_seq_group[request_id] = seq_group
 
         return seq_group
 
@@ -639,6 +650,7 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        wait_on: Optional[str] = None,
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -661,6 +673,8 @@ class LLMEngine:
             prompt_adapter_request: The prompt adapter request to add.
             priority: The priority of the request.
                 Only applicable with priority scheduling.
+            wait_on: If provided, defer scheduling this request until the
+                specified request id finishes.
 
         Details:
             - Set arrival_time to the current time if it is None.
@@ -722,16 +736,24 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
         )
 
-        self._add_processed_request(
-            request_id=request_id,
-            processed_inputs=processed_inputs,
-            params=params,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
-            trace_headers=trace_headers,
-            priority=priority,
+        args = (
+            request_id,
+            processed_inputs,
+            params,
+            arrival_time,
+            lora_request,
+            prompt_adapter_request,
+            trace_headers,
+            priority,
         )
+
+        if wait_on is not None and wait_on in self.request_id_to_seq_group:
+            # Defer scheduling until the dependency finishes.
+            self.pending_requests[request_id] = args
+            self.sync_dependencies[request_id] = wait_on
+            return
+
+        self._add_processed_request(*args)
 
     def _create_sequence_group_with_sampling(
         self,
@@ -808,6 +830,49 @@ class LLMEngine:
             encoder_seq=encoder_seq,
             priority=priority)
         return seq_group
+
+    def fork_request(
+        self,
+        new_request_id: str,
+        source_request_id: str,
+        shared_tokens: int,
+        prompt: PromptType,
+        params: Union[SamplingParams, PoolingParams],
+        **kwargs,
+    ) -> None:
+        """Fork an existing request with shared KV cache."""
+        parent_group = self.request_id_to_seq_group.get(source_request_id)
+        if parent_group is None:
+            raise ValueError(f"unknown source request {source_request_id}")
+        parent_seq = parent_group.seqs[0]
+        prefix_tokens = parent_seq.data.get_token_ids()[:shared_tokens]
+
+        proc = self.input_preprocessor.preprocess(
+            prompt,
+            tokenization_kwargs=kwargs.get("tokenization_kwargs"),
+            lora_request=kwargs.get("lora_request"),
+            prompt_adapter_request=kwargs.get("prompt_adapter_request"),
+        )
+        proc.prompt_token_ids = prefix_tokens + (proc.prompt_token_ids or [])
+
+        args = (
+            new_request_id,
+            proc,
+            params,
+            kwargs.get("arrival_time", time.time()),
+            kwargs.get("lora_request"),
+            kwargs.get("prompt_adapter_request"),
+            kwargs.get("trace_headers"),
+            kwargs.get("priority", 0),
+        )
+
+        wait_on = kwargs.get("wait_on")
+        if wait_on is not None and wait_on in self.request_id_to_seq_group:
+            self.pending_requests[new_request_id] = args
+            self.sync_dependencies[new_request_id] = wait_on
+            return
+
+        self._add_processed_request(*args)
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.
@@ -1309,6 +1374,18 @@ class LLMEngine:
             for finished_request_id in finished_requests_ids:
                 if finished_request_id in self.seq_id_to_seq_group:
                     del self.seq_id_to_seq_group[finished_request_id]
+                if finished_request_id in self.request_id_to_seq_group:
+                    del self.request_id_to_seq_group[finished_request_id]
+                # Schedule any pending requests waiting on this request.
+                pending = [
+                    rid for rid, dep in self.sync_dependencies.items()
+                    if dep == finished_request_id
+                ]
+                for rid in pending:
+                    args = self.pending_requests.pop(rid, None)
+                    if args is not None:
+                        self._add_processed_request(*args)
+                    del self.sync_dependencies[rid]
 
             # Maybe switch from async mode to sync mode
             if not allow_async_output_proc and len(ctx.output_queue) > 0:

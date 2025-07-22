@@ -1502,6 +1502,7 @@ class ParallelSampleSequenceGroup(SequenceGroupBase):
             )  # type: ignore
             assert seq_group is not None
             engine.seq_id_to_seq_group[request_id_i] = group
+            engine.request_id_to_seq_group[request_id_i] = seq_group
             group.to_be_finished[request_id_i] = seq_group
             seqs.append(seq_group.seqs[0])
 
