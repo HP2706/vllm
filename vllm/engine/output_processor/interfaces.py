@@ -33,19 +33,31 @@ class SequenceGroupOutputProcessor(ABC):
         seq_counter: Counter,
         get_tokenizer_for_seq: Callable[[Sequence], AnyTokenizer],
         stop_checker: "StopChecker",
+        special_kwargs=None,
     ):
         """Create an output processor.
 
         This returns a single-step output processor if num_lookahead_slots is
-        zero, else returns a multi-step output processor.
+        zero, else returns a multi-step output processor. If special_kwargs
+        is provided, returns a SequenceHookOutputProcessor for handling 
+        special tokens and sequence dependencies.
         """
         if scheduler_config.num_lookahead_slots == 0:
-            # Importing here to avoid cycle.
-            from vllm.engine.output_processor.single_step import (
-                SingleStepOutputProcessor)
-            return SingleStepOutputProcessor(scheduler_config, detokenizer,
-                                             scheduler, seq_counter,
-                                             stop_checker)
+            # Check if we need the enhanced sequence hook processor
+            if special_kwargs is not None:
+                # Importing here to avoid cycle.
+                from vllm.engine.output_processor.sequence_hook import (
+                    SequenceHookOutputProcessor)
+                return SequenceHookOutputProcessor(
+                    scheduler_config, detokenizer, scheduler, seq_counter,
+                    stop_checker, special_kwargs)
+            else:
+                # Importing here to avoid cycle.
+                from vllm.engine.output_processor.single_step import (
+                    SingleStepOutputProcessor)
+                return SingleStepOutputProcessor(scheduler_config, detokenizer,
+                                                 scheduler, seq_counter,
+                                                 stop_checker)
         else:
             # Importing here to avoid cycle.
             from vllm.engine.output_processor.multi_step import (

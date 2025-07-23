@@ -1288,6 +1288,7 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
+            special_kwargs=self.special_kwargs,
         )
 
         return config

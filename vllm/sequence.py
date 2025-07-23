@@ -61,16 +61,17 @@ class SequenceStatus(enum.IntEnum):
     WAITING = 0
     RUNNING = 1
     SWAPPED = 2
+    BLOCKED = 3 # a sequence can be blocked if it is waiting on another sequence to finish
     # Note: anything after SWAPPED (2) will be considered
     # as a finished status.
-    FINISHED_STOPPED = 3
-    FINISHED_LENGTH_CAPPED = 4
-    FINISHED_ABORTED = 5
-    FINISHED_IGNORED = 6
+    FINISHED_STOPPED = 4
+    FINISHED_LENGTH_CAPPED = 5
+    FINISHED_ABORTED = 6
+    FINISHED_IGNORED = 7
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
-        return status > SequenceStatus.SWAPPED
+        return status > SequenceStatus.BLOCKED
 
     @staticmethod
     def get_finished_reason(status: "SequenceStatus") -> Union[str, None]:
@@ -93,6 +94,49 @@ class SequenceStatus(enum.IntEnum):
 class SequenceStage(enum.Enum):
     PREFILL = enum.auto()
     DECODE = enum.auto()
+
+
+def reverse_topo_iter(dependency_graph: dict[int, set[int]]) -> list[int]:
+    """
+    Iterate over the dependency graph in reverse topological order.
+
+    Returns:
+        A list of node ids in reverse topological order.
+    """
+    # Kahn's algorithm for topological sort, then reverse the result.
+    from collections import defaultdict, deque
+
+    # Build the set of all nodes
+    all_nodes = set(dependency_graph.keys())
+    for children in dependency_graph.values():
+        all_nodes.update(children)
+
+    # Compute in-degree for each node
+    in_degree = defaultdict(int)
+    for node in all_nodes:
+        in_degree[node] = 0
+    for parent, children in dependency_graph.items():
+        for child in children:
+            in_degree[child] += 1
+
+    # Start with nodes that have in-degree 0
+    queue = deque([node for node in all_nodes if in_degree[node] == 0])
+    topo_order = []
+
+    while queue:
+        node = queue.popleft()
+        topo_order.append(node)
+        for child in dependency_graph.get(node, []):
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+
+    if len(topo_order) != len(all_nodes):
+        raise ValueError("Dependency graph has a cycle.")
+
+    # Reverse the topological order
+    return topo_order[::-1]
+    
 
 
 @dataclass
@@ -161,6 +205,8 @@ class SequenceData(msgspec.Struct,
 
     _prompt_embeds: Optional[torch.Tensor] = None
     _output_embeds: Optional[torch.Tensor] = None
+    
+    _parent_prompt_token_ids: Optional[array] = None # only relevant for child of sequence
 
     ### The below fields should not be passed as an argument ###
     _cumulative_logprob: float = 0.0
@@ -179,7 +225,7 @@ class SequenceData(msgspec.Struct,
     _new_appended_tokens: list[int] = msgspec.field(default_factory=list)
 
     # It is used to compute mrope_position_ids.
-    _mrope_position_delta: Optional[int] = None
+    _mrope_position_delta: Optional[int] = None    
 
     @staticmethod
     def from_prompt_token_counts(
@@ -469,6 +515,7 @@ class Sequence:
         eos_token_id: Optional[int] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        can_have_children: bool = False,
     ) -> None:
         self.seq_id = seq_id
         self.inputs = inputs
@@ -496,6 +543,35 @@ class Sequence:
         self.read_offset = 0
         # Input + output tokens
         self.tokens: Optional[list[str]] = None
+        
+        # for partial forking
+        self.parent_seq_id: Optional[int] = None
+        self.can_have_children = can_have_children
+        self.children_seq_ids: set[int] = set()
+
+    @property
+    def is_blocked(self) -> bool:
+        """A sequence is blocked if it is waiting on its children
+        sequences to finish."""
+        return self.status == SequenceStatus.BLOCKED
+    
+    @property
+    def is_child(self) -> bool:
+        """A sequence is a child if it has a parent"""
+        return self.parent_seq_id is not None
+    
+    @property
+    def is_parent(self) -> bool:
+        """A sequence is a parent if it has children"""
+        return len(self.children_seq_ids) > 0
+
+    @property
+    def is_ready(self) -> bool:
+        '''
+        A sequence is ready if it is not BLOCKED (e.g, all its dependencies are finished)
+        '''
+        return self.status == SequenceStatus.WAITING and all(
+            child.is_finished() for child in self.children_seq_ids)
 
     @property
     def n_blocks(self) -> int:
@@ -541,6 +617,12 @@ class Sequence:
     def prompt_adapter_id(self) -> int:
         return self.prompt_adapter_request.prompt_adapter_id \
                         if self.prompt_adapter_request else 0
+                        
+    def block(self):
+        self.status = SequenceStatus.BLOCKED
+        
+    def unblock(self):
+        self.status = SequenceStatus.WAITING
 
     def get_output_text_to_return(self, buffer_length: int,
                                   delta: bool) -> str:
@@ -656,6 +738,17 @@ class Sequence:
         new_seq.seq_id = new_seq_id
         return new_seq
 
+    def spawn_child(self, new_seq_id: int, **spawn_kwargs) -> "Sequence":
+        assert self.can_have_children, "This sequence cannot have children"
+        new_seq = copy.deepcopy(self)
+        new_seq.seq_id = new_seq_id
+        # Reset child-specific attributes
+        new_seq.children_seq_ids = set()
+        new_seq.can_have_children = False # TODO in future support nested children
+        new_seq.status = SequenceStatus.WAITING
+        new_seq.parent_seq_id = self.seq_id
+        return new_seq
+
     def get_num_new_tokens(self) -> int:
         """Get the number of new tokens to be computed.
 
@@ -753,6 +846,52 @@ class SequenceGroup:
         self.priority = priority
 
         self.cached_request_output = None
+
+    def add_child_sequence(self, parent_seq: Sequence,
+                           child_seq: Sequence) -> None:
+        """Adds a child sequence to a parent and updates dependency tracking."""
+        parent_seq_id = parent_seq.seq_id
+        child_seq_id = child_seq.seq_id
+
+        parent_seq.children_seq_ids.add(child_seq_id)
+        self.seqs.append(child_seq)
+        self.seqs_dict[child_seq_id] = child_seq
+
+    def set_finish_child(self, child_seq: Sequence):
+        """Called when a child sequence finishes.
+        """
+        child_seq_id = child_seq.seq_id
+        child_seq.status = SequenceStatus.FINISHED
+        
+        # we find all parents recursively
+        parent_id = child_seq.parent_seq_id
+        
+        parent_seq = self.seqs_dict[parent_id]
+        parent_seq.children_seq_ids.remove(child_seq_id)
+        
+        if len(parent_seq.children_seq_ids) == 0 and parent_seq.status == SequenceStatus.BLOCKED:
+            parent_seq.status = SequenceStatus.WAITING
+        
+    def spawn_child(
+        self,
+        parent_seq_id: int,
+        new_seq_id: int,
+        **spawn_kwargs,
+    ) -> Sequence:
+        """
+        Spawns a new child sequence from a parent.
+
+        The new sequence is forked from the parent, added to the group,
+        and dependency is established. The parent sequence is marked as BLOCKED.
+        """
+        parent_seq = self.seqs_dict[parent_seq_id]
+        child_seq = parent_seq.spawn_child(new_seq_id, **spawn_kwargs)
+        self.add_child_sequence(parent_seq, child_seq)
+        return child_seq
+
+    @property
+    def num_blocked_seqs(self) -> int:
+        return sum(1 for seq in self.seqs if seq.is_blocked())
 
     @property
     def prompt(self) -> Optional[str]:
@@ -1326,7 +1465,7 @@ class HiddenStates(msgspec.Struct, array_like=True,
         """
         # Currently this prunes all seq_ids not present in
         # seq_group_metadata_list which might cause problems where a sequence
-        # may be "paused" then "resumed" later. This should only prune sequences
+        # may be "BLOCKED" then "resumed" later. This should only prune sequences
         # which are confirmed to be aborted.
         seq_ids = get_all_seq_ids(seq_group_metadata_list)
         # Only keep sequence IDs that exist in self._seq_ids

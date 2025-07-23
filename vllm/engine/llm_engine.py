@@ -19,12 +19,13 @@ from typing_extensions import TypeVar
 import vllm.envs as envs
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
-                         VllmConfig)
+                         VllmConfig, SpecialKwargs)
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
     SequenceGroupOutputProcessor)
+from vllm.engine.output_processor.sequence_hook import SequenceHookOutputProcessor
 from vllm.engine.output_processor.stop_checker import StopChecker
 from vllm.engine.output_processor.util import create_output_by_sequence_group
 from vllm.entrypoints.openai.logits_processors import (
@@ -49,7 +50,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.sequence import (ExecuteModelRequest, ParallelSampleSequenceGroup,
                            PoolingSequenceGroupOutput, Sequence, SequenceGroup,
                            SequenceGroupBase, SequenceGroupMetadata,
-                           SequenceGroupOutput, SequenceStatus)
+                           SequenceGroupOutput, SequenceStatus, CompletionSequenceGroupOutput)
 from vllm.tracing import (SpanAttributes, SpanKind, extract_trace_context,
                           init_tracer)
 from vllm.transformers_utils.detokenizer import Detokenizer
@@ -67,6 +68,8 @@ _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 _O = TypeVar("_O", RequestOutput, PoolingRequestOutput)
 _R = TypeVar("_R", default=Any)
+
+
 
 
 @dataclass
@@ -391,6 +394,7 @@ class LLMEngine:
                 get_tokenizer_for_seq,
                 stop_checker=StopChecker(self.scheduler_config.max_model_len,
                                          get_tokenizer_for_seq),
+                special_kwargs=self.vllm_config.special_kwargs,
             ))
 
         self.seq_id_to_seq_group: Dict[str, SequenceGroupBase] = {}
@@ -492,7 +496,8 @@ class LLMEngine:
         """Creates an LLM engine from the engine arguments."""
         # Create the engine configs.
         vllm_config = engine_args.create_engine_config(usage_context)
-
+        assert vllm_config.special_kwargs is not None # TODO: remove this
+        
         engine_cls = cls
         if envs.VLLM_USE_V1:
             from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine
@@ -831,6 +836,9 @@ class LLMEngine:
     def get_vllm_config(self) -> VllmConfig:
         """Gets the vllm configuration."""
         return self.vllm_config
+    
+    def get_special_kwargs(self) -> SpecialKwargs:
+        return self.vllm_config.special_kwargs
 
     def get_model_config(self) -> ModelConfig:
         """Gets the model configuration."""

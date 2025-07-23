@@ -4363,6 +4363,13 @@ class CompilationConfig:
 
 @config
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class SpecialKwargs:
+    sync_token_id : int
+    promise_token_id : int
+    
+
+@config
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
@@ -4423,6 +4430,9 @@ class VllmConfig:
     you are using. Contents must be hashable."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
+    
+    special_kwargs: SpecialKwargs = field(default_factory=SpecialKwargs)
+    """Special kwargs for the model."""
 
     def compute_hash(self) -> str:
         """
