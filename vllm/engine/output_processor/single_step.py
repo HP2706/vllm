@@ -2,19 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import List
-
 from vllm.config import SchedulerConfig
 from vllm.core.scheduler import Scheduler
 from vllm.engine.output_processor.interfaces import (
     SequenceGroupOutputProcessor)
 from vllm.engine.output_processor.stop_checker import StopChecker
+from vllm.engine.output_processor.streaming_tool_parser import StreamingToolParser
 from vllm.logger import init_logger
-from vllm.sequence import (CompletionSequenceGroupOutput, SequenceGroup,
-                           SequenceGroupOutput)
+from vllm.sequence import (CompletionSequenceGroupOutput,
+                           SequenceGroup, SequenceGroupOutput)
 from vllm.transformers_utils.detokenizer import Detokenizer
 from vllm.utils import Counter
 
 logger = init_logger(__name__)
+
 
 
 def single_step_process_prompt_logprob(
@@ -75,8 +76,12 @@ class SingleStepOutputProcessor(SequenceGroupOutputProcessor):
 
     def __init__(self, scheduler_config: SchedulerConfig,
                  detokenizer: Detokenizer, scheduler: List[Scheduler],
-                 seq_counter: Counter, stop_checker: StopChecker):
+                 seq_counter: Counter, stop_checker: StopChecker,
+                 streaming_tool_parser : StreamingToolParser):
         self.scheduler_config = scheduler_config
+        
+        # Tool parsing state per sequence group
+        self.streaming_tool_parser = streaming_tool_parser
         self.detokenizer = detokenizer
         self.scheduler = scheduler
         self.seq_counter = seq_counter

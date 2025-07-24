@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from typing import Callable, List
+from typing import Any, Callable, Dict, List, Optional
 
 from vllm.config import SchedulerConfig
 from vllm.core.scheduler import Scheduler
@@ -11,7 +11,8 @@ from vllm.sequence import Sequence, SequenceGroup, SequenceGroupOutput
 from vllm.transformers_utils.detokenizer import Detokenizer
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import Counter
-
+from vllm.engine.output_processor.streaming_tool_parser import StreamingToolParser
+from vllm.entrypoints.openai.special_kwargs import SpecialKwargs
 
 class SequenceGroupOutputProcessor(ABC):
     """Interface for logic that processes new token ids in sequence groups,
@@ -33,6 +34,7 @@ class SequenceGroupOutputProcessor(ABC):
         seq_counter: Counter,
         get_tokenizer_for_seq: Callable[[Sequence], AnyTokenizer],
         stop_checker: "StopChecker",
+        streaming_tool_parser : "StreamingToolParser" | None,
         special_kwargs=None,
     ):
         """Create an output processor.
@@ -45,19 +47,25 @@ class SequenceGroupOutputProcessor(ABC):
         if scheduler_config.num_lookahead_slots == 0:
             # Check if we need the enhanced sequence hook processor
             if special_kwargs is not None:
+                assert streaming_tool_parser is not None
+                assert isinstance(special_kwargs, SpecialKwargs)
                 # Importing here to avoid cycle.
                 from vllm.engine.output_processor.sequence_hook import (
                     SequenceHookOutputProcessor)
-                return SequenceHookOutputProcessor(
-                    scheduler_config, detokenizer, scheduler, seq_counter,
-                    stop_checker, special_kwargs)
+                return SequenceHookOutputProcessor(scheduler_config, detokenizer,
+                                                 scheduler, seq_counter,
+                                                 stop_checker,
+                                                 streaming_tool_parser,
+                                                 special_kwargs)
             else:
                 # Importing here to avoid cycle.
                 from vllm.engine.output_processor.single_step import (
                     SingleStepOutputProcessor)
+                assert streaming_tool_parser is not None
                 return SingleStepOutputProcessor(scheduler_config, detokenizer,
                                                  scheduler, seq_counter,
-                                                 stop_checker)
+                                                 stop_checker,
+                                                 streaming_tool_parser)
         else:
             # Importing here to avoid cycle.
             from vllm.engine.output_processor.multi_step import (

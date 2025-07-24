@@ -7,6 +7,7 @@ from vllm.config import SchedulerConfig, SpecialKwargs
 from vllm.core.scheduler import Scheduler
 from vllm.engine.output_processor.single_step import SingleStepOutputProcessor
 from vllm.engine.output_processor.stop_checker import StopChecker
+from vllm.engine.output_processor.streaming_tool_parser import StreamingToolParser
 from vllm.logger import init_logger
 from vllm.sequence import (CompletionSequenceGroupOutput, SequenceGroup, 
                           SequenceGroupOutput, SequenceStatus)
@@ -30,9 +31,16 @@ class SequenceHookOutputProcessor(SingleStepOutputProcessor):
     def __init__(self, scheduler_config: SchedulerConfig,
                  detokenizer: Detokenizer, scheduler: List[Scheduler],
                  seq_counter: Counter, stop_checker: StopChecker,
+                 streaming_tool_parser: StreamingToolParser,
                  special_kwargs: SpecialKwargs):
-        super().__init__(scheduler_config, detokenizer, scheduler, 
-                        seq_counter, stop_checker)
+        super().__init__(
+            scheduler_config=scheduler_config,
+            detokenizer=detokenizer,
+            scheduler=scheduler,
+            seq_counter=seq_counter,
+            stop_checker=stop_checker,
+            streaming_tool_parser=streaming_tool_parser
+        )
         self.special_kwargs = special_kwargs
         
     def process_outputs(self, sequence_group: SequenceGroup,
