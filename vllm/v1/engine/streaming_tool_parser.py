@@ -13,34 +13,31 @@ logger = init_logger(__name__)
 class StreamingToolParser:
     """
     V1 Streaming tool parser that integrates with the V1 OutputProcessor architecture.
-    Handles streaming tool parsing for EngineCoreOutput and maintains state per request.
+    Each request has its own instance of StreamingToolParser.
     """
     
-    def __init__(self, anytokenizer: AnyTokenizer, tool_parser: ToolParser):
-        self.anytokenizer = anytokenizer
+    @classmethod
+    def from_new_request(
+        cls,
+        tool_parser: ToolParser,
+    ) -> "StreamingToolParser":
+        return cls(tool_parser)
+    
+    def __init__(self, tool_parser: ToolParser):
         self.tool_parser = tool_parser
-        self.chunks_mapping: Dict[str, List[DeltaMessage]] = {}  # request_id -> chunks
-        self.tool_states: Dict[str, Dict[int, Any]] = {}  # request_id -> tool_index -> state
-        self.yielded_indices: Dict[str, Set[int]] = {}  # request_id -> yielded tool indices
+        self.chunks_mapping: List[DeltaMessage] = []  # chunks
+        self.tool_states: Dict[int, Any] = {}  # tool_index -> state
+        self.yielded_indices: Set[int] = set()  # yielded tool indices
         
         # Track accumulated text and token IDs per request
-        self.accumulated_text: Dict[str, str] = {}  # request_id -> accumulated text
-        self.accumulated_token_ids: Dict[str, List[int]] = {}  # request_id -> accumulated token IDs
+        self.accumulated_text: str = ""  # accumulated text
+        self.accumulated_token_ids: List[int] = []  # accumulated token IDs
         
-    def _initialize_request_state(self, request_id: str) -> None:
-        """Initialize state for a new request if not already present."""
-        if request_id not in self.chunks_mapping:
-            self.chunks_mapping[request_id] = []
-        if request_id not in self.tool_states:
-            self.tool_states[request_id] = {}
-        if request_id not in self.yielded_indices:
-            self.yielded_indices[request_id] = set()
-        if request_id not in self.accumulated_text:
-            self.accumulated_text[request_id] = ""
-        if request_id not in self.accumulated_token_ids:
-            self.accumulated_token_ids[request_id] = []
-        
-    def update_from_engine_output(self, engine_output: EngineCoreOutput) -> Optional[DeltaMessage]:
+    def update_from_engine_output(
+        self, 
+        engine_output: EngineCoreOutput,
+        tokenizer: AnyTokenizer,
+    ) -> Optional[DeltaMessage]:
         """
         Process an EngineCoreOutput and extract tool call deltas.
         
@@ -50,8 +47,6 @@ class StreamingToolParser:
         Returns:
             DeltaMessage containing tool call updates, if any
         """
-        request_id = engine_output.request_id
-        self._initialize_request_state(request_id)
         
         # Extract token information from engine output
         new_token_ids = engine_output.new_token_ids
@@ -60,19 +55,19 @@ class StreamingToolParser:
              
         # Decode the delta text from new tokens
         token_ids_list: List[int] = list(new_token_ids)
-        delta_text: str = self.anytokenizer.decode(token_ids_list, skip_special_tokens=True)
+        delta_text: str = tokenizer.decode(token_ids_list, skip_special_tokens=True)
         
         # Get previous state
-        previous_text = self.accumulated_text[request_id]
-        previous_token_ids = self.accumulated_token_ids[request_id].copy()
+        previous_text = self.accumulated_text
+        previous_token_ids = self.accumulated_token_ids.copy()
         
         # Update accumulated state
         current_text = previous_text + delta_text
         current_token_ids = previous_token_ids + token_ids_list
         
         # Store updated state
-        self.accumulated_text[request_id] = current_text
-        self.accumulated_token_ids[request_id] = current_token_ids
+        self.accumulated_text = current_text
+        self.accumulated_token_ids = current_token_ids
         
         # Call the existing tool parser with proper accumulated context
         try:
@@ -90,26 +85,22 @@ class StreamingToolParser:
             delta_message = None
         
         if delta_message is not None:
-            self.chunks_mapping[request_id].append(delta_message)
+            self.chunks_mapping.append(delta_message)
             
         return delta_message
         
-    def get_tool_calls_from_deltas(self, request_id: str, delta: DeltaMessage) -> Optional[List[ToolCall]]:
+    def get_tool_calls_from_deltas(self, delta: DeltaMessage) -> Optional[List[ToolCall]]:
         """
         Stream ToolCall objects as they become complete while processing DeltaMessage objects.
         
         Args:
-            request_id: Request ID to process deltas for
             delta: DeltaMessage containing DeltaToolCall deltas
             
         Returns:
             List of complete ToolCall objects if any become ready, None otherwise
         """
-        # Ensure request state is initialized
-        self._initialize_request_state(request_id)
-        
-        tool_state = self.tool_states[request_id]
-        yielded_indices = self.yielded_indices[request_id]
+        tool_state = self.tool_states
+        yielded_indices = self.yielded_indices
     
         tool_calls = []
         if not delta.tool_calls:
@@ -173,7 +164,11 @@ class StreamingToolParser:
         
         return tool_calls if tool_calls else None
     
-    def process_engine_output_for_tools(self, engine_output: EngineCoreOutput) -> Optional[List[ToolCall]]:
+    def process_engine_output_for_tools(
+        self, 
+        engine_output: EngineCoreOutput,
+        tokenizer: AnyTokenizer,
+    ) -> Optional[List[ToolCall]]:
         """
         Complete processing pipeline: extract deltas from engine output and return ready tool calls.
         
@@ -183,53 +178,18 @@ class StreamingToolParser:
         Returns:
             List of complete ToolCall objects if any are ready
         """
-        delta_message = self.update_from_engine_output(engine_output)
+        delta_message = self.update_from_engine_output(engine_output, tokenizer)
         if delta_message is None:
             return None
         
-        return self.get_tool_calls_from_deltas(engine_output.request_id, delta_message)
+        return self.get_tool_calls_from_deltas(delta_message)
     
-    def clear_request_state(self, request_id: str) -> None:
+    def clear_state(self) -> None:
         """Clear state for a specific request."""
-        self.chunks_mapping.pop(request_id, None)
-        self.tool_states.pop(request_id, None)
-        self.yielded_indices.pop(request_id, None)
-        self.accumulated_text.pop(request_id, None)
-        self.accumulated_token_ids.pop(request_id, None)
+        self.chunks_mapping.clear()
+        self.tool_states.clear()
+        self.yielded_indices.clear()
+        self.accumulated_text = ""
+        self.accumulated_token_ids.clear()
         
-    def get_request_chunks(self, request_id: str) -> List[DeltaMessage]:
-        """Get all accumulated chunks for a request."""
-        return self.chunks_mapping.get(request_id, [])
 
-
-class ToolAwareRequestState:
-    """
-    Enhanced RequestState that includes tool parsing capabilities.
-    This would integrate with the V1 OutputProcessor architecture.
-    """
-    
-    def __init__(self, request_id: str, tool_parser: Optional[StreamingToolParser] = None):
-        self.request_id = request_id
-        self.tool_parser = tool_parser
-        self.accumulated_tool_calls: List[ToolCall] = []
-        
-    def process_engine_output(self, engine_output: EngineCoreOutput) -> Optional[List[ToolCall]]:
-        """Process engine output and return any new complete tool calls."""
-        if self.tool_parser is None:
-            return None
-            
-        new_tool_calls = self.tool_parser.process_engine_output_for_tools(engine_output)
-        if new_tool_calls:
-            self.accumulated_tool_calls.extend(new_tool_calls)
-            
-        return new_tool_calls
-        
-    def get_all_tool_calls(self) -> List[ToolCall]:
-        """Get all tool calls accumulated for this request."""
-        return self.accumulated_tool_calls.copy()
-        
-    def clear_tool_state(self) -> None:
-        """Clear tool parsing state for this request."""
-        if self.tool_parser:
-            self.tool_parser.clear_request_state(self.request_id)
-        self.accumulated_tool_calls.clear()

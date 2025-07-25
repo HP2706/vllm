@@ -26,12 +26,13 @@ from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
+from vllm.v1.engine.streaming_tool_parser import StreamingToolParser
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
                                      StatLoggerFactory)
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
-
+from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import ToolParserManager
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
@@ -71,7 +72,7 @@ class LLMEngine:
         self.stat_logger: Optional[StatLoggerBase] = None
         if self.log_stats:
             self.stat_logger = PrometheusStatLogger(vllm_config)
-
+        
         # important: init dp group before init the engine_core
         # In the decoupled engine case this is handled in EngineCoreProc.
         parallel_config = vllm_config.parallel_config
@@ -90,6 +91,12 @@ class LLMEngine:
                 scheduler_config=vllm_config.scheduler_config,
                 lora_config=vllm_config.lora_config)
 
+        if vllm_config.tool_parser_name is not None:
+            tool_parser_cls = ToolParserManager.get_tool_parser(vllm_config.tool_parser_name)
+            self.tool_parser = tool_parser_cls(self.tokenizer) 
+        else:
+            self.tool_parser = None
+
         # Processor (convert Inputs --> EngineCoreRequests)
         self.processor = Processor(vllm_config=vllm_config,
                                    tokenizer=self.tokenizer,
@@ -97,7 +104,8 @@ class LLMEngine:
 
         # OutputProcessor (convert EngineCoreOutputs --> RequestOutput).
         self.output_processor = OutputProcessor(self.tokenizer,
-                                                log_stats=self.log_stats)
+                                                log_stats=self.log_stats,
+                                                tool_parser=self.tool_parser)
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
         self.engine_core = EngineCoreClient.make_client(
@@ -107,6 +115,9 @@ class LLMEngine:
             executor_class=executor_class,
             log_stats=self.log_stats,
         )
+        
+        #self.tool_parser = 
+        # self.streaming_tool_parser = StreamingToolParser(self.tokenizer, self.tool_parser)
 
         if not multiprocess_mode:
             # for v0 compatibility
@@ -245,6 +256,9 @@ class LLMEngine:
 
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+        
+        # 4) Add new requests
+        # TODO: add new requests 
 
         # 4) Record stats
         if self.stat_logger is not None:

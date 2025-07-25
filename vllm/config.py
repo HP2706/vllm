@@ -4370,6 +4370,8 @@ class VllmConfig:
     you are using. Contents must be hashable."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
+    
+    tool_parser_name : Optional[str] = field(default_factory=str) # for custom tool parser must be set
 
     def compute_hash(self) -> str:
         """
