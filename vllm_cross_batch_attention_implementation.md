@@ -286,6 +286,11 @@ The current code proves:
   `examples/offline_inference/cross_batch_trained_adapter_probe.py`.
   The HF mode should be run with the parent repo `.venv`; the vLLM mode should
   be run with the vLLM fork `.venv`; compare mode summarizes the JSON outputs.
+- Follow-up isolation showed HF standard `Qwen3ForCausalLM + PEFT` is much
+  closer to vLLM than the custom HF batch-parscale class on the same 128-token
+  prompt. Standard HF vs vLLM had top-1 logprob drift around `0.005`; the
+  larger tail drift appears tied to the custom grouped cross-batch path or to
+  the identical-replica probe, not plain vLLM LoRA loading.
 
 The current code still does not prove:
 
@@ -323,9 +328,9 @@ The current code still does not prove:
    async scheduling, mixed grouped/ungrouped traffic, prefix-cache hits, and
    connector paths.
 2. Investigate the remaining lower-ranked logprob drift in the trained-adapter
-   probe. The first suspects are HF/vLLM LoRA `lm_head.base_layer.weight`
-   handling, tokenizer-vs-config vocab padding, and any residual attention-mask
-   differences at the first virtual position.
+   probe. The first suspects are the custom HF grouped mask semantics, whether
+   the identical-replica first-virtual-position probe is sensitive enough, and
+   residual attention-mask differences at the first virtual position.
 3. Convert the conservative KV-capacity preflight into a true transactional
    grouped allocation or rollback mechanism if broader scheduler tests expose a
    remaining split-group path.
