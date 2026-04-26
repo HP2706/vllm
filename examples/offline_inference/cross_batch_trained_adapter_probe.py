@@ -201,6 +201,44 @@ def dump_hf_logits(args: argparse.Namespace) -> None:
     print(f"wrote HF logits {tuple(logits.shape)} to {args.output}")
 
 
+def dump_native_hf_logits(args: argparse.Namespace) -> None:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    prompt_ids = build_prompt_ids(tokenizer, args.prompt, args.prompt_len)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.base_model,
+        torch_dtype=torch.bfloat16,
+    ).eval().cuda()
+
+    input_ids = torch.tensor(
+        [prompt_ids] * args.group_size, dtype=torch.long, device="cuda"
+    )
+    with torch.inference_mode(), torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16
+    ):
+        logits = model(input_ids=input_ids).logits[:, -1, :].float().cpu()
+
+    save_tensor(
+        args.output,
+        {
+            "engine": "hf-native",
+            "base_model": args.base_model,
+            "prompt": args.prompt,
+            "prompt_ids": prompt_ids,
+            "group_size": args.group_size,
+            "vocab_size": logits.shape[-1],
+            "logits": logits,
+            "logprobs": torch.log_softmax(logits, dim=-1),
+        },
+    )
+    print(f"wrote native HF logits {tuple(logits.shape)} to {args.output}")
+
+
 def run_vllm(args: argparse.Namespace) -> None:
     from vllm import LLM, TokensPrompt
     from vllm.lora.request import LoRARequest
@@ -341,6 +379,85 @@ def dump_vllm_logits(args: argparse.Namespace) -> None:
     )
     save_tensor(args.output, dumped)
     print(f"wrote vLLM logits {tuple(logits.shape)} to {args.output}")
+
+
+def dump_native_vllm_logits(args: argparse.Namespace) -> None:
+    import torch
+
+    from vllm import LLM, SamplingParams, TokensPrompt
+    from vllm.config import VllmConfig
+    from vllm.tokenizers import get_tokenizer
+    from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessor
+
+    class DumpLogitsProcessor(LogitsProcessor):
+
+        def __init__(
+            self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
+        ):
+            self.path = os.environ["VLLM_CBA_DUMP_LOGITS_PATH"]
+            self.call_idx = 0
+
+        def is_argmax_invariant(self) -> bool:
+            return False
+
+        def update_state(self, batch_update: BatchUpdate | None):
+            return None
+
+        def apply(self, logits: torch.Tensor) -> torch.Tensor:
+            if self.call_idx == 0:
+                save_tensor(
+                    self.path,
+                    {
+                        "engine": "vllm-native",
+                        "call_idx": self.call_idx,
+                        "logits": logits.detach().float().cpu(),
+                    },
+                )
+            self.call_idx += 1
+            return logits
+
+    tokenizer = get_tokenizer(args.base_model)
+    prompt_ids = build_prompt_ids(tokenizer, args.prompt, args.prompt_len)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.unlink(missing_ok=True)
+    os.environ["VLLM_CBA_DUMP_LOGITS_PATH"] = str(output_path)
+
+    llm = LLM(
+        model=args.base_model,
+        dtype="bfloat16",
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.group_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=True,
+        attention_config={"backend": "FLEX_ATTENTION"},
+        logits_processors=[DumpLogitsProcessor],
+    )
+    sampling_params = [
+        SamplingParams(temperature=0.0, max_tokens=1)
+        for _ in range(args.group_size)
+    ]
+    outputs = llm.generate(
+        [TokensPrompt(prompt_token_ids=prompt_ids) for _ in range(args.group_size)],
+        sampling_params,
+        use_tqdm=False,
+    )
+    dumped = torch.load(output_path, map_location="cpu")
+    logits = dumped["logits"]
+    dumped.update(
+        {
+            "base_model": args.base_model,
+            "prompt": args.prompt,
+            "prompt_ids": prompt_ids,
+            "group_size": args.group_size,
+            "vocab_size": logits.shape[-1],
+            "generated": outputs[0].outputs[0].text,
+            "generated_token_ids": list(outputs[0].outputs[0].token_ids),
+            "logprobs": torch.log_softmax(logits, dim=-1),
+        }
+    )
+    save_tensor(args.output, dumped)
+    print(f"wrote native vLLM logits {tuple(logits.shape)} to {args.output}")
 
 
 def run_compare(args: argparse.Namespace) -> None:
@@ -501,6 +618,10 @@ def make_parser() -> argparse.ArgumentParser:
     dump_hf_parser.add_argument("--parent-repo", default=DEFAULT_PARENT_REPO)
     dump_hf_parser.set_defaults(func=dump_hf_logits)
 
+    dump_native_hf_parser = subparsers.add_parser("dump-native-hf-logits")
+    add_common(dump_native_hf_parser)
+    dump_native_hf_parser.set_defaults(func=dump_native_hf_logits)
+
     vllm_parser = subparsers.add_parser("vllm")
     add_common(vllm_parser)
     vllm_parser.add_argument("--max-lora-rank", type=int, default=16)
@@ -516,6 +637,14 @@ def make_parser() -> argparse.ArgumentParser:
         "--gpu-memory-utilization", type=float, default=0.45
     )
     dump_vllm_parser.set_defaults(func=dump_vllm_logits)
+
+    dump_native_vllm_parser = subparsers.add_parser("dump-native-vllm-logits")
+    add_common(dump_native_vllm_parser)
+    dump_native_vllm_parser.add_argument("--max-model-len", type=int, default=192)
+    dump_native_vllm_parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=0.45
+    )
+    dump_native_vllm_parser.set_defaults(func=dump_native_vllm_logits)
 
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("--hf-json", required=True)
