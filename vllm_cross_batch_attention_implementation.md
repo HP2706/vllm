@@ -7,8 +7,8 @@ Base implementation commit: `f32aa74b7` (`Add V1 cross-batch FlexAttention proto
 Latest local progress:
 
 - `410f173b1` (`Harden cross-batch FlexAttention prototype`)
-- Current uncommitted slice wires the active V1 `gpu_model_runner.py` path and
-  fixes a FlexAttention mask lowering issue.
+- `97965e321` (`Wire cross-batch metadata through active GPU runner`)
+- Current slice adds a Qwen3-0.6B HF-reference numerical assertion.
 
 ## What Is Implemented
 
@@ -78,6 +78,18 @@ python -m pytest tests/v1/test_cross_batch_attention.py \
 ```
 
 Result after latest changes: `15 passed, 3 deselected`
+
+```bash
+VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_NO_USAGE_STATS=1 \
+  python -m pytest tests/v1/test_cross_batch_attention_hf_reference.py -q -s
+```
+
+Result: `1 passed`
+
+This loads `Qwen/Qwen3-0.6B` through both the HF-side
+`src/modeling_qwen3_batch_parscale.py` reference and vLLM FlexAttention, then
+asserts first-token selected logprobs are within `0.15` absolute tolerance and
+that the HF top-5 token set is present in vLLM's returned top logprobs.
 
 This includes:
 
@@ -258,11 +270,10 @@ The current code proves:
 - Qwen3-0.6B can run grouped cross-batch FlexAttention smoke generation and a
   baseline-vs-cross logprob probe
 
-The current code does not yet prove:
+The current code still does not prove:
 
-- logits are numerically asserted against a reference implementation in CI
-- full end-to-end model logits are asserted against the HF-side Qwen3
-  batch-parscale implementation
+- HF-reference numerical agreement beyond the one two-prompt Qwen3-0.6B
+  first-token smoke case
 - grouped scheduling is correct under every preemption, priority, async, and
   connector interaction
 
@@ -283,13 +294,15 @@ The current code does not yet prove:
 - Eager mode is forced when cross-batch metadata is present. This avoids graph
   specialization problems and the first FlexAttention peer-topology shape
   problem, but leaves performance work unresolved.
-- No full end-to-end correctness test compares against the HF-side
-  `modeling_qwen3_batch_parscale.py` behavior.
+- The HF-side `modeling_qwen3_batch_parscale.py` comparison is currently one
+  slow CUDA smoke case only. It does not cover decode continuation, longer
+  virtual schedules, padding, prefix cache, or more than one group.
 
 ## Next Steps
 
-1. Add a full Qwen3-specific logits/reference comparison against the HF-side
-   `modeling_qwen3_batch_parscale.py` implementation.
+1. Broaden the Qwen3 HF-reference comparison beyond the current two-prompt
+   first-token smoke case: decode continuation, padding, multiple groups, and
+   longer virtual schedules.
 2. Broaden scheduler tests around priority scheduling, preemption,
    async scheduling, mixed grouped/ungrouped traffic, prefix-cache hits, and
    connector paths.
