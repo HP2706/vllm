@@ -16,10 +16,12 @@ from vllm.v1.attention.backends.flex_attention import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.cross_batch_attention import (
+    CrossBatchAttentionData,
     CrossBatchAttentionMetadata,
     CrossBatchAttentionParams,
 )
 from vllm.v1.request import Request
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 
 
@@ -295,6 +297,67 @@ def test_flex_cross_batch_mask_uses_absolute_virtual_positions():
     assert not mask_mod(
         torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(5)
     )
+
+
+def test_gpu_model_runner_builds_cross_batch_metadata_in_batch_order():
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.input_batch = SimpleNamespace(
+        req_ids=["req-1", "req-0"],
+        token_ids_cpu_tensor=torch.tensor(
+            [
+                [10, 99, 11, 0],
+                [20, 99, 21, 0],
+                [0, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    scheduler_output = SimpleNamespace(
+        cross_batch_attention_data=CrossBatchAttentionData(
+            params_by_req_id={
+                "req-0": CrossBatchAttentionParams(
+                    group_id="group-a",
+                    replica_id=0,
+                    group_size=2,
+                    virtual_token_id=99,
+                    virtual_window_size=2,
+                ),
+                "req-1": CrossBatchAttentionParams(
+                    group_id="group-a",
+                    replica_id=1,
+                    group_size=2,
+                    virtual_token_id=99,
+                    virtual_window_size=2,
+                ),
+            }
+        )
+    )
+
+    metadata = runner._make_cross_batch_attention_metadata(
+        scheduler_output=scheduler_output,
+        num_reqs=2,
+        num_reqs_padded=3,
+    )
+
+    assert metadata is not None
+    assert metadata.enabled.tolist() == [True, True, False]
+    assert metadata.replica_ids.tolist() == [1, 0, -1]
+    assert metadata.allowed_peer_batches.tolist() == [
+        [1, -1, -1],
+        [0, -1, -1],
+        [-1, -1, -1],
+    ]
+    assert metadata.allowed_peer_mask.tolist() == [
+        [True, False, False],
+        [True, False, False],
+        [False, False, False],
+    ]
+    assert metadata.token_ids.tolist() == [
+        [10, 99, 11, 0],
+        [20, 99, 21, 0],
+        [0, 0, 0, 0],
+    ]
 
 
 def make_flex_metadata_for_dense_reference(

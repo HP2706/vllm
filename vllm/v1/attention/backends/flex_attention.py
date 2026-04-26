@@ -443,41 +443,41 @@ class FlexAttentionMetadata:
                 b, h, logical_q_idx, same_logical_kv_idx
             )
 
-            peer_batches = cross_batch.allowed_peer_batches[q_req]
-            peer_mask = cross_batch.allowed_peer_mask[q_req]
-            safe_peer_batches = torch.where(peer_mask, peer_batches, 0)
-            peer_logical_block_idx = self.physical_to_logical[
-                safe_peer_batches, physical_kv_block.unsqueeze(-1)
-            ]
-            peer_logical_kv_idx = (
-                peer_logical_block_idx * self.block_size
-                + physical_kv_offset.unsqueeze(-1)
-            )
-            peer_valid = (
-                peer_mask
-                & (peer_logical_block_idx >= 0)
-                & (peer_logical_kv_idx >= 0)
-                & (peer_logical_kv_idx < self.seq_lens[safe_peer_batches])
-            )
-
             safe_q_idx = torch.clamp(logical_q_idx, min=0)
-            safe_peer_kv_idx = torch.clamp(peer_logical_kv_idx, min=0)
             virtual_token_id = cross_batch.virtual_token_ids[q_req]
             q_is_virtual = (
                 cross_batch.token_ids[q_req, safe_q_idx] == virtual_token_id
             )
-            peer_kv_is_virtual = (
-                cross_batch.token_ids[safe_peer_batches, safe_peer_kv_idx]
-                == virtual_token_id
-            )
-            peer_allowed = (
-                peer_valid
-                & q_is_virtual.unsqueeze(-1)
-                & peer_kv_is_virtual
-                & (logical_q_idx.unsqueeze(-1) >= peer_logical_kv_idx)
-            )
+            peer_allowed = same_allowed & False
+            for peer_idx in range(cross_batch.allowed_peer_batches.shape[1]):
+                peer_batch = cross_batch.allowed_peer_batches[:, peer_idx][q_req]
+                peer_mask = cross_batch.allowed_peer_mask[:, peer_idx][q_req]
+                safe_peer_batch = torch.where(peer_mask, peer_batch, 0)
+                peer_logical_block_idx = self.physical_to_logical[
+                    safe_peer_batch, physical_kv_block
+                ]
+                peer_logical_kv_idx = (
+                    peer_logical_block_idx * self.block_size + physical_kv_offset
+                )
+                peer_valid = (
+                    peer_mask
+                    & (peer_logical_block_idx >= 0)
+                    & (peer_logical_kv_idx >= 0)
+                    & (peer_logical_kv_idx < self.seq_lens[safe_peer_batch])
+                )
+                safe_peer_kv_idx = torch.clamp(peer_logical_kv_idx, min=0)
+                peer_kv_is_virtual = (
+                    cross_batch.token_ids[safe_peer_batch, safe_peer_kv_idx]
+                    == virtual_token_id
+                )
+                peer_allowed = peer_allowed | (
+                    peer_valid
+                    & q_is_virtual
+                    & peer_kv_is_virtual
+                    & (logical_q_idx >= peer_logical_kv_idx)
+                )
 
-            return same_allowed | peer_allowed.any(dim=-1)
+            return same_allowed | peer_allowed
 
         return final_mask_mod
 

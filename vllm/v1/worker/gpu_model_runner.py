@@ -127,6 +127,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.cross_batch_attention import CrossBatchAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -1894,6 +1895,7 @@ class GPUModelRunner(
         logits_indices: torch.Tensor | None = None,
         use_spec_decode: bool = False,
         for_cudagraph_capture: bool = False,
+        scheduler_output: "SchedulerOutput | None" = None,
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
@@ -1974,6 +1976,14 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
         )
+        if scheduler_output is not None:
+            cm_base.cross_batch_attention_metadata = (
+                self._make_cross_batch_attention_metadata(
+                    scheduler_output=scheduler_output,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                )
+            )
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -2132,6 +2142,82 @@ class GPUModelRunner(
             )
 
         return attn_metadata, spec_decode_common_attn_metadata
+
+    def _make_cross_batch_attention_metadata(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> CrossBatchAttentionMetadata | None:
+        data = scheduler_output.cross_batch_attention_data
+        if data is None:
+            return None
+
+        params_by_req_id = data.params_by_req_id
+        enabled_np = np.zeros(num_reqs_padded, dtype=np.bool_)
+        group_ids_np = np.full(num_reqs_padded, -1, dtype=np.int32)
+        replica_ids_np = np.full(num_reqs_padded, -1, dtype=np.int32)
+        virtual_token_ids_np = np.full(num_reqs_padded, -1, dtype=np.int32)
+        virtual_window_sizes_np = np.zeros(num_reqs_padded, dtype=np.int32)
+
+        group_name_to_id: dict[str, int] = {}
+        seen_replicas: set[tuple[str, int]] = set()
+        for batch_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            params = params_by_req_id.get(req_id)
+            if params is None:
+                continue
+            group_numeric_id = group_name_to_id.setdefault(
+                params.group_id, len(group_name_to_id)
+            )
+            replica_key = (params.group_id, params.replica_id)
+            if replica_key in seen_replicas:
+                raise ValueError("Duplicate cross-batch attention replica_id in batch")
+            seen_replicas.add(replica_key)
+            enabled_np[batch_idx] = True
+            group_ids_np[batch_idx] = group_numeric_id
+            replica_ids_np[batch_idx] = params.replica_id
+            virtual_token_ids_np[batch_idx] = params.virtual_token_id
+            virtual_window_sizes_np[batch_idx] = params.virtual_window_size
+
+        allowed_peer_batches_np = np.full(
+            (num_reqs_padded, num_reqs_padded), -1, dtype=np.int32
+        )
+        allowed_peer_mask_np = np.zeros((num_reqs_padded, num_reqs_padded), dtype=bool)
+        for query_batch in range(num_reqs):
+            if not enabled_np[query_batch]:
+                continue
+            peer_write_idx = 0
+            for peer_batch in range(num_reqs):
+                if query_batch == peer_batch or not enabled_np[peer_batch]:
+                    continue
+                if group_ids_np[query_batch] != group_ids_np[peer_batch]:
+                    continue
+                allowed_peer_batches_np[query_batch, peer_write_idx] = peer_batch
+                allowed_peer_mask_np[query_batch, peer_write_idx] = True
+                peer_write_idx += 1
+
+        return CrossBatchAttentionMetadata(
+            enabled=torch.tensor(enabled_np, dtype=torch.bool, device=self.device),
+            group_ids=torch.tensor(group_ids_np, dtype=torch.int32, device=self.device),
+            replica_ids=torch.tensor(
+                replica_ids_np, dtype=torch.int32, device=self.device
+            ),
+            allowed_peer_batches=torch.tensor(
+                allowed_peer_batches_np, dtype=torch.int32, device=self.device
+            ),
+            allowed_peer_mask=torch.tensor(
+                allowed_peer_mask_np, dtype=torch.bool, device=self.device
+            ),
+            virtual_token_ids=torch.tensor(
+                virtual_token_ids_np, dtype=torch.int32, device=self.device
+            ),
+            virtual_window_sizes=torch.tensor(
+                virtual_window_sizes_np, dtype=torch.int32, device=self.device
+            ),
+            token_ids=self.input_batch.token_ids_cpu_tensor[:num_reqs_padded].to(
+                device=self.device, non_blocking=True
+            ),
+        )
 
     def _compute_cascade_attn_prefix_lens(
         self,
@@ -3649,6 +3735,7 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                force_eager=scheduler_output.cross_batch_attention_data is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -3729,6 +3816,7 @@ class GPUModelRunner(
                     ubatch_slices=ubatch_slices_attn,
                     logits_indices=logits_indices,
                     use_spec_decode=use_spec_decode,
+                    scheduler_output=scheduler_output,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,

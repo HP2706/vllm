@@ -2,7 +2,13 @@
 
 Branch: `feature/cross-batch-flex-attention`
 
-Implementation commit: `f32aa74b7` (`Add V1 cross-batch FlexAttention prototype`)
+Base implementation commit: `f32aa74b7` (`Add V1 cross-batch FlexAttention prototype`)
+
+Latest local progress:
+
+- `410f173b1` (`Harden cross-batch FlexAttention prototype`)
+- Current uncommitted slice wires the active V1 `gpu_model_runner.py` path and
+  fixes a FlexAttention mask lowering issue.
 
 ## What Is Implemented
 
@@ -22,8 +28,8 @@ Implementation commit: `f32aa74b7` (`Add V1 cross-batch FlexAttention prototype`
 - The scheduler has conservative group preparation for waiting and running
   requests so enabled groups are kept together when the full group fits the
   current budget.
-- `GPUModelRunner.prepare_inputs()` translates request-id keyed group metadata
-  into worker batch-order tensors after the existing decode-first sort.
+- Both V1 GPU runner paths translate request-id keyed group metadata into
+  worker batch-order tensors after the existing request ordering.
 - `CommonAttentionMetadata` and `FlexAttentionMetadata` carry optional
   cross-batch tensors.
 - FlexAttention now supports a cross-batch decoder mask:
@@ -38,8 +44,8 @@ Implementation commit: `f32aa74b7` (`Add V1 cross-batch FlexAttention prototype`
 - The scheduler now performs a conservative KV-capacity preflight before
   preparing a complete cross-batch group, so a group that cannot fit is skipped
   before any replica is admitted.
-- Cross-batch batches force eager execution by overriding the batch descriptor to
-  `CUDAGraphMode.NONE`.
+- Cross-batch batches force eager execution by constraining the batch descriptor
+  to `CUDAGraphMode.NONE`.
 
 ## Tests Run
 
@@ -56,7 +62,7 @@ Passing tests:
 python -m pytest tests/v1/test_cross_batch_attention.py -q
 ```
 
-Result after latest changes: `11 passed`
+Result after latest changes: `12 passed`
 
 ```bash
 python -m pytest tests/kernels/test_flex_attention.py -q \
@@ -71,7 +77,7 @@ python -m pytest tests/v1/test_cross_batch_attention.py \
   -k "cross_batch or physical_to_logical_mapping_handles_reused_blocks"
 ```
 
-Result after latest changes: `14 passed, 3 deselected`
+Result after latest changes: `15 passed, 3 deselected`
 
 This includes:
 
@@ -79,6 +85,8 @@ This includes:
 - dense reference attention-output coverage showing non-virtual query outputs
   match baseline while virtual query outputs change with peer virtual context
 - regression coverage for absolute-position virtual causality
+- regression coverage that the active V1 `gpu_model_runner.py` builds
+  cross-batch metadata in worker batch order, including padded rows
 - rejection coverage for non-FlexAttention backends
 - scheduler KV-capacity preflight coverage for grouped admission
 
@@ -92,6 +100,7 @@ python -m py_compile \
   vllm/v1/worker/gpu/input_batch.py \
   vllm/v1/worker/gpu/attn_utils.py \
   vllm/v1/worker/gpu/model_runner.py \
+  vllm/v1/worker/gpu_model_runner.py \
   vllm/v1/worker/gpu/model_states/default.py \
   vllm/v1/attention/backend.py \
   vllm/v1/attention/backends/flex_attention.py \
@@ -112,6 +121,46 @@ Result: `physical_to_logical_mapping_handles_reused_blocks` passed, but
 `test_block_mask_direct_vs_slow_path` failed because it tries to download gated
 `meta-llama/Meta-Llama-3-8B` from Hugging Face and receives `401 Unauthorized`.
 This failure is unrelated to the cross-batch implementation.
+
+## Qwen3 Logit Probe
+
+After wiring `vllm/v1/worker/gpu_model_runner.py`, the live Qwen3-0.6B
+FlexAttention path now receives cross-batch metadata. A debug probe confirmed
+that request 0's final prompt query at logical position 10 can see request 1's
+virtual token at logical position 10 through the physical KV block mask.
+
+Command shape:
+
+```bash
+VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_NO_USAGE_STATS=1 \
+  .venv/bin/python <qwen3 baseline-vs-cross logprob script>
+```
+
+Configuration:
+
+- model: `Qwen/Qwen3-0.6B`
+- backend: `attention_config={"backend": "FLEX_ATTENTION"}`
+- prompts:
+  - `Solve briefly: 2 + 2 = reasoning`
+  - `Solve briefly: 3 + 5 = reasoning`
+- `virtual_token_id`: token id for `" reasoning"` (`32711`)
+- `virtual_window_size`: `10`, aligning the HF reference position schedule with
+  the final prompt token
+
+Baseline top logprobs:
+
+- request 0: `1882 -2.2030`, `3019 -2.3280`, `198 -2.5780`
+- request 1: `3019 -1.9411`, `1882 -2.0661`, `198 -2.5661`
+
+Cross-batch top logprobs:
+
+- request 0: `1882 -2.8368`, `3019 -2.8368`, `198 -3.0243`
+- request 1: `3019 -2.7174`, `1882 -2.8424`, `198 -3.0924`
+
+This proves the active vLLM path is no longer silently falling back to baseline
+attention. The values are close to the earlier HF FlexAttention reference probe,
+but there is still no committed end-to-end numerical assertion against
+`src/modeling_qwen3_batch_parscale.py`.
 
 ## Qwen3-0.6B Smoke Test
 
@@ -185,7 +234,7 @@ config home.
 
 This is a working prototype slice, not production-ready.
 
-Approximate state: about 75% of the first milestone.
+Approximate state: about 82% of the first milestone.
 
 The current code proves:
 
@@ -198,17 +247,22 @@ The current code proves:
   leaving non-virtual query outputs identical in a dense reference test
 - The Qwen3 batch-parscale absolute-position virtual causality rule is now
   reflected in the vLLM mask
+- The active V1 `gpu_model_runner.py` path now forwards cross-batch metadata to
+  FlexAttention
+- A live Qwen3-0.6B baseline-vs-cross probe now shows material logit changes
+  from peer virtual-token attention
 - Group admission has a conservative KV-capacity preflight before moving a
   complete group to the scheduling front
 - Cross-batch metadata is rejected for non-FlexAttention backends instead of
   silently being ignored
-- Qwen3-0.6B can run a grouped cross-batch FlexAttention smoke generation
+- Qwen3-0.6B can run grouped cross-batch FlexAttention smoke generation and a
+  baseline-vs-cross logprob probe
 
 The current code does not yet prove:
 
-- logits are numerically correct against a reference implementation
-- full end-to-end model logits match the HF-side Qwen3 batch-parscale
-  implementation
+- logits are numerically asserted against a reference implementation in CI
+- full end-to-end model logits are asserted against the HF-side Qwen3
+  batch-parscale implementation
 - grouped scheduling is correct under every preemption, priority, async, and
   connector interaction
 
@@ -227,7 +281,8 @@ The current code does not yet prove:
   sharing edge cases, sliding-window interactions, encoder-decoder models, and
   LoRA interaction are not validated.
 - Eager mode is forced when cross-batch metadata is present. This avoids graph
-  specialization problems but leaves performance work unresolved.
+  specialization problems and the first FlexAttention peer-topology shape
+  problem, but leaves performance work unresolved.
 - No full end-to-end correctness test compares against the HF-side
   `modeling_qwen3_batch_parscale.py` behavior.
 
