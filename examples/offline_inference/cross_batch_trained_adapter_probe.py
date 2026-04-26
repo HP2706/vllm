@@ -52,6 +52,34 @@ def save_tensor(path: str, data: dict[str, Any]) -> None:
     torch.save(data, output_path)
 
 
+def make_sampling_params(args: argparse.Namespace) -> list[Any]:
+    from vllm import SamplingParams
+
+    params = []
+    for replica_id in range(args.group_size):
+        extra_args = None
+        if args.cross_batch:
+            extra_args = {
+                "cross_batch_attention": {
+                    "enabled": True,
+                    "group_id": "trained-probe",
+                    "replica_id": replica_id,
+                    "group_size": args.group_size,
+                    "virtual_token_id": -1,
+                    "virtual_window_size": args.virtual_window_size,
+                }
+            }
+        params.append(
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=1,
+                logprobs=getattr(args, "top_k", None),
+                extra_args=extra_args,
+            )
+        )
+    return params
+
+
 def run_hf(args: argparse.Namespace) -> None:
     import torch
     from peft import PeftModel
@@ -73,7 +101,7 @@ def run_hf(args: argparse.Namespace) -> None:
         config_kwargs={
             "n_batches": args.group_size,
             "parscale_n": args.parscale_n,
-            "cross_batch_attend": True,
+            "cross_batch_attend": args.cross_batch,
             "noise_ratio": 0.0,
             "noise_method": "none",
             "virtual_window_size": args.virtual_window_size,
@@ -97,6 +125,7 @@ def run_hf(args: argparse.Namespace) -> None:
         "engine": "hf",
         "base_model": args.base_model,
         "adapter": args.adapter,
+        "cross_batch": args.cross_batch,
         "prompt": args.prompt,
         "prompt_ids": prompt_ids,
         "top": [
@@ -133,7 +162,7 @@ def dump_hf_logits(args: argparse.Namespace) -> None:
         config_kwargs={
             "n_batches": args.group_size,
             "parscale_n": args.parscale_n,
-            "cross_batch_attend": True,
+            "cross_batch_attend": args.cross_batch,
             "noise_ratio": 0.0,
             "noise_method": "none",
             "virtual_window_size": args.virtual_window_size,
@@ -159,6 +188,7 @@ def dump_hf_logits(args: argparse.Namespace) -> None:
             "engine": "hf",
             "base_model": args.base_model,
             "adapter": args.adapter,
+            "cross_batch": args.cross_batch,
             "prompt": args.prompt,
             "prompt_ids": prompt_ids,
             "group_size": args.group_size,
@@ -172,7 +202,7 @@ def dump_hf_logits(args: argparse.Namespace) -> None:
 
 
 def run_vllm(args: argparse.Namespace) -> None:
-    from vllm import LLM, SamplingParams, TokensPrompt
+    from vllm import LLM, TokensPrompt
     from vllm.lora.request import LoRARequest
     from vllm.tokenizers import get_tokenizer
 
@@ -192,24 +222,7 @@ def run_vllm(args: argparse.Namespace) -> None:
     )
     lora = LoRARequest("trained_cross_batch", 1, args.adapter)
     llm.llm_engine.add_lora(lora)
-    sampling_params = [
-        SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            logprobs=args.top_k,
-            extra_args={
-                "cross_batch_attention": {
-                    "enabled": True,
-                    "group_id": "trained-probe",
-                    "replica_id": replica_id,
-                    "group_size": args.group_size,
-                    "virtual_token_id": -1,
-                    "virtual_window_size": args.virtual_window_size,
-                }
-            },
-        )
-        for replica_id in range(args.group_size)
-    ]
+    sampling_params = make_sampling_params(args)
     outputs = llm.generate(
         [TokensPrompt(prompt_token_ids=prompt_ids) for _ in range(args.group_size)],
         sampling_params,
@@ -233,6 +246,7 @@ def run_vllm(args: argparse.Namespace) -> None:
         "engine": "vllm",
         "base_model": args.base_model,
         "adapter": args.adapter,
+        "cross_batch": args.cross_batch,
         "prompt": args.prompt,
         "prompt_ids": prompt_ids,
         "generated": outputs[0].outputs[0].text,
@@ -246,7 +260,7 @@ def run_vllm(args: argparse.Namespace) -> None:
 def dump_vllm_logits(args: argparse.Namespace) -> None:
     import torch
 
-    from vllm import LLM, SamplingParams, TokensPrompt
+    from vllm import LLM, TokensPrompt
     from vllm.config import VllmConfig
     from vllm.lora.request import LoRARequest
     from vllm.tokenizers import get_tokenizer
@@ -301,23 +315,7 @@ def dump_vllm_logits(args: argparse.Namespace) -> None:
     )
     lora = LoRARequest("trained_cross_batch", 1, args.adapter)
     llm.llm_engine.add_lora(lora)
-    sampling_params = [
-        SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            extra_args={
-                "cross_batch_attention": {
-                    "enabled": True,
-                    "group_id": "trained-probe",
-                    "replica_id": replica_id,
-                    "group_size": args.group_size,
-                    "virtual_token_id": -1,
-                    "virtual_window_size": args.virtual_window_size,
-                }
-            },
-        )
-        for replica_id in range(args.group_size)
-    ]
+    sampling_params = make_sampling_params(args)
     outputs = llm.generate(
         [TokensPrompt(prompt_token_ids=prompt_ids) for _ in range(args.group_size)],
         sampling_params,
@@ -330,6 +328,7 @@ def dump_vllm_logits(args: argparse.Namespace) -> None:
         {
             "base_model": args.base_model,
             "adapter": args.adapter,
+            "cross_batch": args.cross_batch,
             "prompt": args.prompt,
             "prompt_ids": prompt_ids,
             "group_size": args.group_size,
@@ -484,6 +483,13 @@ def make_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--virtual-window-size", type=int, default=127)
         subparser.add_argument("--top-k", type=int, default=20)
         subparser.add_argument("--output", required=True)
+        subparser.add_argument(
+            "--disable-cross-batch",
+            action="store_false",
+            dest="cross_batch",
+            help="Run the same probe without cross-batch attention.",
+        )
+        subparser.set_defaults(cross_batch=True)
 
     hf_parser = subparsers.add_parser("hf")
     add_common(hf_parser)
