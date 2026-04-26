@@ -310,6 +310,38 @@ The current code still does not prove:
 
 ## Known Gaps
 
+- A local A100-SXM4-80GB throughput sweep on 2026-04-26 shows the current
+  prototype is correct but not yet performant at larger grouped batch sizes.
+  Configuration: `Qwen/Qwen3-0.6B`, bf16, V1 FlexAttention,
+  `enforce_eager=True`, prefix caching disabled, group size `4`,
+  `virtual_token_id=-1`, `virtual_window_size=prompt_len-1`,
+  `ignore_eos=True`, 3 measured repeats after warmup.
+
+  Output-token throughput:
+
+  | prompt | decode | groups | reqs | baseline tok/s | cross-batch tok/s |
+  | --- | --- | --- | --- | ---: | ---: |
+  | 128 | 64 | 1 | 4 | 278.86 | 263.36 |
+  | 128 | 64 | 2 | 8 | 552.58 | 273.11 |
+  | 128 | 64 | 4 | 16 | 1084.82 | 154.39 |
+  | 128 | 256 | 1 | 4 | 275.23 | 243.59 |
+  | 128 | 256 | 2 | 8 | 548.96 | 192.21 |
+  | 128 | 256 | 4 | 16 | 994.36 | 104.00 |
+  | 512 | 64 | 1 | 4 | 270.39 | 121.36 |
+  | 512 | 64 | 2 | 8 | 490.98 | 78.04 |
+  | 512 | 64 | 4 | 16 | 564.99 | 40.26 |
+  | 512 | 256 | 1 | 4 | 279.66 | 124.73 |
+  | 512 | 256 | 2 | 8 | 456.77 | 79.93 |
+  | 512 | 256 | 4 | 16 | 515.04 | 41.16 |
+
+  A short capacity probe at prompt `128`, decode `64`, and one measured repeat
+  showed cross-batch runs at 5 groups / 20 requests (`150.33` output tok/s), but
+  fails to compile at 6 groups / 24 requests and 8 groups / 32 requests with
+  FlexAttention Triton resource errors:
+  `Required: 197120 Hardware limit: 166912` at 6 groups and
+  `Required: 221696 Hardware limit: 166912` at 8 groups. This is a backend
+  kernel-resource limit, not KV capacity exhaustion.
+
 - Scheduling now has a conservative KV-capacity preflight for grouped admission,
   but it is still not a true transactional allocation/rollback layer. Prefix
   cache, encoder, connector, and preemption interactions need broader tests.
