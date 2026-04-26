@@ -282,6 +282,10 @@ The current code proves:
 - The same trained adapter generated coherent arithmetic text in vLLM on
   `Problem: What is 7 + 15?\nSolution:`:
   `7 + 15 = 22\nSolution 2\n...`.
+- Added an opt-in trained-adapter probe:
+  `examples/offline_inference/cross_batch_trained_adapter_probe.py`.
+  The HF mode should be run with the parent repo `.venv`; the vLLM mode should
+  be run with the vLLM fork `.venv`; compare mode summarizes the JSON outputs.
 
 The current code still does not prove:
 
@@ -315,17 +319,15 @@ The current code still does not prove:
 
 ## Next Steps
 
-1. Turn the trained-adapter probe into a committed, opt-in script or test that
-   records both HF and vLLM top-k logprobs, generation text, and tolerances.
-2. Broaden scheduler tests around priority scheduling, preemption,
+1. Broaden scheduler tests around priority scheduling, preemption,
    async scheduling, mixed grouped/ungrouped traffic, prefix-cache hits, and
    connector paths.
-3. Investigate the remaining lower-ranked logprob drift in the trained-adapter
+2. Investigate the remaining lower-ranked logprob drift in the trained-adapter
    probe. The first suspects are HF/vLLM LoRA `lm_head.base_layer.weight`
    handling, tokenizer-vs-config vocab padding, and any residual attention-mask
    differences at the first virtual position.
-4. Convert the conservative KV-capacity preflight into a true transactional
+3. Convert the conservative KV-capacity preflight into a true transactional
    grouped allocation or rollback mechanism if broader scheduler tests expose a
    remaining split-group path.
-5. Investigate the baseline FlexAttention Qwen3 engine-core teardown log if it
+4. Investigate the baseline FlexAttention Qwen3 engine-core teardown log if it
    matters for the surrounding benchmark harness.
