@@ -269,11 +269,25 @@ The current code proves:
   silently being ignored
 - Qwen3-0.6B can run grouped cross-batch FlexAttention smoke generation and a
   baseline-vs-cross logprob probe
+- The trained non-dynamic checkpoint at
+  `/home/ubuntu/parallel_reasoning/experiments/finetune/checkpoints/nb4_nr0.5_nv4_cbad0.1_2026-04-26-12-33-30/step_0001107_tokens_9M/adapter`
+  loads in vLLM as a Qwen3-0.6B LoRA, including the `lm_head` LoRA path.
+- vLLM now supports the trained HF position-scheduled virtual-token mode by
+  setting `virtual_token_id=-1`; in that mode virtual positions are
+  `virtual_window_size`, then every `virtual_window_size + 1` positions.
+- A real-checkpoint probe with a 128-token prompt, `virtual_window_size=127`,
+  four replicas, and first-token generation at the first virtual position
+  matched the HF reference top-1 token: both chose token id `220` (`" "`).
+  HF logprob was `-0.014691`; vLLM logprob was `-0.042636`.
+- The same trained adapter generated coherent arithmetic text in vLLM on
+  `Problem: What is 7 + 15?\nSolution:`:
+  `7 + 15 = 22\nSolution 2\n...`.
 
 The current code still does not prove:
 
-- HF-reference numerical agreement beyond the one two-prompt Qwen3-0.6B
-  first-token smoke case
+- tight HF-reference numerical agreement for the full distribution on the
+  trained adapter. The first virtual-position probe matched top-1, but lower
+  ranked common top tokens still differed by roughly `0.46` to `2.78` logprob.
 - grouped scheduling is correct under every preemption, priority, async, and
   connector interaction
 
@@ -290,24 +304,28 @@ The current code still does not prove:
   reject cross-batch metadata.
 - DBO/microbatching, DCP/DP, speculative decoding, CUDA graphs, prefix-cache
   sharing edge cases, sliding-window interactions, encoder-decoder models, and
-  LoRA interaction are not validated.
+  broad LoRA interaction are not validated.
 - Eager mode is forced when cross-batch metadata is present. This avoids graph
   specialization problems and the first FlexAttention peer-topology shape
   problem, but leaves performance work unresolved.
-- The HF-side `modeling_qwen3_batch_parscale.py` comparison is currently one
-  slow CUDA smoke case only. It does not cover decode continuation, longer
-  virtual schedules, padding, prefix cache, or more than one group.
+- The HF-side `modeling_qwen3_batch_parscale.py` comparison is still ad hoc.
+  It now covers the trained non-dynamic adapter at the first virtual position,
+  but does not cover decode continuation across several virtual positions,
+  padding, prefix cache, or more than one group.
 
 ## Next Steps
 
-1. Broaden the Qwen3 HF-reference comparison beyond the current two-prompt
-   first-token smoke case: decode continuation, padding, multiple groups, and
-   longer virtual schedules.
+1. Turn the trained-adapter probe into a committed, opt-in script or test that
+   records both HF and vLLM top-k logprobs, generation text, and tolerances.
 2. Broaden scheduler tests around priority scheduling, preemption,
    async scheduling, mixed grouped/ungrouped traffic, prefix-cache hits, and
    connector paths.
-3. Convert the conservative KV-capacity preflight into a true transactional
+3. Investigate the remaining lower-ranked logprob drift in the trained-adapter
+   probe. The first suspects are HF/vLLM LoRA `lm_head.base_layer.weight`
+   handling, tokenizer-vs-config vocab padding, and any residual attention-mask
+   differences at the first virtual position.
+4. Convert the conservative KV-capacity preflight into a true transactional
    grouped allocation or rollback mechanism if broader scheduler tests expose a
    remaining split-group path.
-4. Investigate the baseline FlexAttention Qwen3 engine-core teardown log if it
+5. Investigate the baseline FlexAttention Qwen3 engine-core teardown log if it
    matters for the surrounding benchmark harness.

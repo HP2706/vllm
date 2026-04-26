@@ -299,6 +299,43 @@ def test_flex_cross_batch_mask_uses_absolute_virtual_positions():
     )
 
 
+def test_flex_cross_batch_mask_can_use_position_scheduled_virtual_tokens():
+    metadata = make_flex_metadata_for_mask(
+        torch.tensor(
+            [
+                [10, 11, 12, 13, 14],
+                [20, 21, 22, 23, 24],
+            ],
+            dtype=torch.int32,
+        )
+    )
+    metadata.block_size = 1
+    metadata.query_start_loc = torch.tensor([0, 5], dtype=torch.int32)
+    metadata.decode_offset = torch.tensor([2, 0], dtype=torch.int32)
+    metadata.seq_lens = torch.tensor([5, 5], dtype=torch.int32)
+    metadata.physical_to_logical = torch.tensor(
+        [
+            [-1, -1, -1, -1, -1, -1],
+            [-1, 0, 1, 2, 3, 4],
+        ],
+        dtype=torch.long,
+    )
+    metadata.cross_batch_attention_metadata.virtual_token_ids = torch.tensor(
+        [-1, -1], dtype=torch.int32
+    )
+    metadata.cross_batch_attention_metadata.virtual_window_sizes = torch.tensor(
+        [2, 2], dtype=torch.int32
+    )
+    mask_mod = metadata.get_cross_batch_mask_mod()
+
+    assert mask_mod(
+        torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(3)
+    )
+    assert not mask_mod(
+        torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(4)
+    )
+
+
 def test_gpu_model_runner_builds_cross_batch_metadata_in_batch_order():
     runner = object.__new__(GPUModelRunner)
     runner.device = torch.device("cpu")

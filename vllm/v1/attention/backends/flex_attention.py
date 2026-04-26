@@ -443,11 +443,21 @@ class FlexAttentionMetadata:
                 b, h, logical_q_idx, same_logical_kv_idx
             )
 
-            safe_q_idx = torch.clamp(logical_q_idx, min=0)
             virtual_token_id = cross_batch.virtual_token_ids[q_req]
-            q_is_virtual = (
-                cross_batch.token_ids[q_req, safe_q_idx] == virtual_token_id
+            virtual_window_size = cross_batch.virtual_window_sizes[q_req]
+            virtual_stride = virtual_window_size + 1
+            q_is_virtual_by_position = (
+                (virtual_token_id < 0)
+                & (virtual_window_size > 0)
+                & (logical_q_idx >= 0)
+                & ((logical_q_idx % virtual_stride) == virtual_window_size)
             )
+            safe_q_idx = torch.clamp(logical_q_idx, min=0)
+            q_is_virtual_by_token = (
+                (virtual_token_id >= 0)
+                & (cross_batch.token_ids[q_req, safe_q_idx] == virtual_token_id)
+            )
+            q_is_virtual = q_is_virtual_by_position | q_is_virtual_by_token
             peer_allowed = same_allowed & False
             for peer_idx in range(cross_batch.allowed_peer_batches.shape[1]):
                 peer_batch = cross_batch.allowed_peer_batches[:, peer_idx][q_req]
@@ -466,9 +476,21 @@ class FlexAttentionMetadata:
                     & (peer_logical_kv_idx < self.seq_lens[safe_peer_batch])
                 )
                 safe_peer_kv_idx = torch.clamp(peer_logical_kv_idx, min=0)
+                peer_kv_is_virtual_by_position = (
+                    (virtual_token_id < 0)
+                    & (virtual_window_size > 0)
+                    & (peer_logical_kv_idx >= 0)
+                    & ((peer_logical_kv_idx % virtual_stride) == virtual_window_size)
+                )
+                peer_kv_is_virtual_by_token = (
+                    (virtual_token_id >= 0)
+                    & (
+                        cross_batch.token_ids[safe_peer_batch, safe_peer_kv_idx]
+                        == virtual_token_id
+                    )
+                )
                 peer_kv_is_virtual = (
-                    cross_batch.token_ids[safe_peer_batch, safe_peer_kv_idx]
-                    == virtual_token_id
+                    peer_kv_is_virtual_by_position | peer_kv_is_virtual_by_token
                 )
                 peer_allowed = peer_allowed | (
                     peer_valid
