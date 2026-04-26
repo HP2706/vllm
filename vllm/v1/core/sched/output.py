@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from vllm.v1.cross_batch_attention import CrossBatchAttentionData
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -211,6 +213,10 @@ class SchedulerOutput:
     # list of mm_hash strings associated with the encoder outputs to be
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
+
+    # Optional request-id keyed cross-batch attention metadata for the scheduled
+    # requests in this step.
+    cross_batch_attention_data: CrossBatchAttentionData | None = None
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

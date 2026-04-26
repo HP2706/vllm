@@ -7,6 +7,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
+from vllm.v1.cross_batch_attention import CrossBatchAttentionMetadata
 
 
 class InputBuffers:
@@ -77,6 +78,8 @@ class InputBatch:
     # Whether any requests in batch use structured output.
     has_structured_output_reqs: bool
 
+    cross_batch_attention_metadata: CrossBatchAttentionMetadata | None = None
+
     @classmethod
     def make_dummy(
         cls,
@@ -143,6 +146,7 @@ class InputBatch:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=False,
+            cross_batch_attention_metadata=None,
         )
 
 

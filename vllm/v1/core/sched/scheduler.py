@@ -51,6 +51,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.cross_batch_attention import CrossBatchAttentionData
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -372,8 +373,21 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        prepared_running_cross_batch_groups: set[str] = set()
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            cross_batch = request.cross_batch_attention
+            if (
+                cross_batch is not None
+                and cross_batch.group_id not in prepared_running_cross_batch_groups
+            ):
+                if not self._prepare_cross_batch_running_group(
+                    request, req_index, token_budget
+                ):
+                    break
+                prepared_running_cross_batch_groups.add(cross_batch.group_id)
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -553,6 +567,7 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            prepared_cross_batch_groups: set[str] = set()
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -575,6 +590,20 @@ class Scheduler(SchedulerInterface):
                         )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
+                    continue
+
+                cross_batch = request.cross_batch_attention
+                if (
+                    cross_batch is not None
+                    and cross_batch.group_id not in prepared_cross_batch_groups
+                ):
+                    if not self._prepare_cross_batch_waiting_group(
+                        request, token_budget
+                    ):
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                    prepared_cross_batch_groups.add(cross_batch.group_id)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -877,6 +906,10 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks,
             )
 
+        cross_batch_attention_data = CrossBatchAttentionData.from_scheduled_requests(
+            scheduled_new_reqs + scheduled_resumed_reqs + scheduled_running_reqs
+        )
+
         # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
@@ -902,6 +935,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            cross_batch_attention_data=cross_batch_attention_data,
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
@@ -925,6 +959,128 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _estimate_num_new_tokens_for_running_request(
+        self, request: Request, token_budget: int
+    ) -> int:
+        num_new_tokens = (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+        if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+            num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+        num_new_tokens = min(num_new_tokens, token_budget)
+        return min(
+            num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+        )
+
+    def _prepare_cross_batch_running_group(
+        self, request: Request, req_index: int, token_budget: int
+    ) -> bool:
+        params = request.cross_batch_attention
+        if params is None:
+            return True
+
+        group = [
+            candidate
+            for candidate in self.running
+            if candidate.cross_batch_attention is not None
+            and candidate.cross_batch_attention.group_id == params.group_id
+            and self._estimate_num_new_tokens_for_running_request(
+                candidate, token_budget
+            )
+            > 0
+        ]
+        if len(group) != params.group_size:
+            return False
+        replica_ids = [req.cross_batch_attention.replica_id for req in group]
+        if len(set(replica_ids)) != len(replica_ids):
+            raise ValueError("Duplicate cross-batch attention replica_id in group")
+
+        estimated_tokens = sum(
+            self._estimate_num_new_tokens_for_running_request(req, token_budget)
+            for req in group
+        )
+        if estimated_tokens > token_budget:
+            return False
+
+        group = sorted(group, key=lambda req: req.cross_batch_attention.replica_id)
+        group_set = set(group)
+        remainder = [req for req in self.running if req not in group_set]
+        self.running = remainder[:req_index] + group + remainder[req_index:]
+        return True
+
+    def _prepare_cross_batch_waiting_group(
+        self, request: Request, token_budget: int
+    ) -> bool:
+        """Move a complete cross-batch group to the waiting front.
+
+        This is a conservative first-pass admission rule for cross-batch
+        attention. It only handles requests that are still in waiting queues and
+        estimates the first scheduled chunk before any prefix-cache or encoder
+        side effects are applied by the normal scheduling path.
+        """
+        params = request.cross_batch_attention
+        if params is None:
+            return True
+
+        group: list[Request] = []
+        for candidate in itertools.chain(self.waiting, self.skipped_waiting):
+            candidate_params = candidate.cross_batch_attention
+            if candidate_params is None:
+                continue
+            if candidate_params.group_id == params.group_id:
+                if (
+                    candidate_params.group_size != params.group_size
+                    or candidate_params.virtual_token_id != params.virtual_token_id
+                    or candidate_params.virtual_window_size
+                    != params.virtual_window_size
+                ):
+                    raise ValueError(
+                        "All cross-batch attention replicas in a group must "
+                        "share group_size, virtual_token_id, and "
+                        "virtual_window_size"
+                    )
+                group.append(candidate)
+
+        if len(group) != params.group_size:
+            return False
+
+        replica_ids = [req.cross_batch_attention.replica_id for req in group]
+        if len(set(replica_ids)) != len(replica_ids):
+            raise ValueError("Duplicate cross-batch attention replica_id in group")
+
+        if len(self.running) + len(group) > self.max_num_running_reqs:
+            return False
+
+        estimated_tokens = 0
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        for group_req in group:
+            if self._is_blocked_waiting_status(group_req.status):
+                return False
+            num_new_tokens = group_req.num_tokens - group_req.num_computed_tokens
+            if 0 < threshold < num_new_tokens:
+                num_new_tokens = threshold
+            if not self.scheduler_config.enable_chunked_prefill:
+                if num_new_tokens > token_budget:
+                    return False
+            estimated_tokens += min(num_new_tokens, token_budget)
+
+        if estimated_tokens > token_budget:
+            return False
+
+        self.waiting.remove_requests(group)
+        self.skipped_waiting.remove_requests(group)
+
+        # Schedule replicas in explicit replica order to make tests and metadata
+        # stable. FCFS prepends in reverse; priority queues ignore prepend order
+        # and keep their normal priority semantics.
+        for group_req in reversed(
+            sorted(group, key=lambda req: req.cross_batch_attention.replica_id)
+        ):
+            self.waiting.prepend_request(group_req)
+        return True
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

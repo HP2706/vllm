@@ -43,6 +43,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.cross_batch_attention import CrossBatchAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -741,6 +742,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
         )
 
+        cross_batch_attention_metadata = self._make_cross_batch_attention_metadata(
+            scheduler_output,
+            req_ids,
+            idx_mapping,
+            num_reqs,
+        )
+
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -763,6 +771,75 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
+            cross_batch_attention_metadata=cross_batch_attention_metadata,
+        )
+
+    def _make_cross_batch_attention_metadata(
+        self,
+        scheduler_output: SchedulerOutput,
+        req_ids: list[str],
+        idx_mapping: torch.Tensor,
+        num_reqs: int,
+    ) -> CrossBatchAttentionMetadata | None:
+        data = scheduler_output.cross_batch_attention_data
+        if data is None:
+            return None
+
+        params_by_req_id = data.params_by_req_id
+        device = self.device
+        enabled_np = np.zeros(num_reqs, dtype=np.bool_)
+        group_ids_np = np.full(num_reqs, -1, dtype=np.int32)
+        replica_ids_np = np.full(num_reqs, -1, dtype=np.int32)
+        virtual_token_ids_np = np.full(num_reqs, -1, dtype=np.int32)
+        virtual_window_sizes_np = np.zeros(num_reqs, dtype=np.int32)
+
+        group_name_to_id: dict[str, int] = {}
+        seen_replicas: set[tuple[str, int]] = set()
+        for batch_idx, req_id in enumerate(req_ids):
+            params = params_by_req_id.get(req_id)
+            if params is None:
+                continue
+            group_numeric_id = group_name_to_id.setdefault(
+                params.group_id, len(group_name_to_id)
+            )
+            replica_key = (params.group_id, params.replica_id)
+            if replica_key in seen_replicas:
+                raise ValueError("Duplicate cross-batch attention replica_id in batch")
+            seen_replicas.add(replica_key)
+            enabled_np[batch_idx] = True
+            group_ids_np[batch_idx] = group_numeric_id
+            replica_ids_np[batch_idx] = params.replica_id
+            virtual_token_ids_np[batch_idx] = params.virtual_token_id
+            virtual_window_sizes_np[batch_idx] = params.virtual_window_size
+
+        allowed_peer_batches_np = np.full((num_reqs, num_reqs), -1, dtype=np.int32)
+        allowed_peer_mask_np = np.zeros((num_reqs, num_reqs), dtype=np.bool_)
+        for query_batch in range(num_reqs):
+            if not enabled_np[query_batch]:
+                continue
+            peer_write_idx = 0
+            for peer_batch in range(num_reqs):
+                if query_batch == peer_batch or not enabled_np[peer_batch]:
+                    continue
+                if group_ids_np[query_batch] != group_ids_np[peer_batch]:
+                    continue
+                allowed_peer_batches_np[query_batch, peer_write_idx] = peer_batch
+                allowed_peer_mask_np[query_batch, peer_write_idx] = True
+                peer_write_idx += 1
+
+        return CrossBatchAttentionMetadata(
+            enabled=async_copy_to_gpu(enabled_np, device=device),
+            group_ids=async_copy_to_gpu(group_ids_np, device=device),
+            replica_ids=async_copy_to_gpu(replica_ids_np, device=device),
+            allowed_peer_batches=async_copy_to_gpu(
+                allowed_peer_batches_np, device=device
+            ),
+            allowed_peer_mask=async_copy_to_gpu(allowed_peer_mask_np, device=device),
+            virtual_token_ids=async_copy_to_gpu(virtual_token_ids_np, device=device),
+            virtual_window_sizes=async_copy_to_gpu(
+                virtual_window_sizes_np, device=device
+            ),
+            token_ids=self.req_states.all_token_ids.gpu[idx_mapping.long()],
         )
 
     def prepare_attn(
@@ -903,6 +980,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_across_dp = None
 
         skip_compiled = False
+        if scheduler_output.cross_batch_attention_data is not None:
+            # Cross-batch attention metadata changes peer topology per step. Keep
+            # the first implementation eager until graph specialization is
+            # explicitly modeled.
+            skip_compiled = True
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_toks,
+                num_reqs=num_reqs,
+            )
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
             # when encoder inputs are scheduled, because this step updates

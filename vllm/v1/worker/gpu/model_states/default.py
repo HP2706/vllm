@@ -169,5 +169,8 @@ class DefaultModelState(ModelState):
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            cross_batch_attention_metadata=(
+                input_batch.cross_batch_attention_metadata
+            ),
         )
         return attn_metadata

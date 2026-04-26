@@ -10,6 +10,8 @@ import numpy as np
 import torch
 from typing_extensions import deprecated
 
+from vllm.v1.cross_batch_attention import CrossBatchAttentionMetadata
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.cache import CacheDType
@@ -357,6 +359,8 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens: torch.Tensor | None = None
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
+
+    cross_batch_attention_metadata: CrossBatchAttentionMetadata | None = None
 
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None

@@ -37,6 +37,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     is_quantized_kv_cache,
 )
+from vllm.v1.cross_batch_attention import CrossBatchAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
@@ -333,6 +334,7 @@ class FlexAttentionMetadata:
     transformed_score_mod: _score_mod_signature | None = None
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
+    cross_batch_attention_metadata: CrossBatchAttentionMetadata | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -405,6 +407,80 @@ class FlexAttentionMetadata:
                 self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx),
                 False,
             )
+
+        return final_mask_mod
+
+    def get_cross_batch_mask_mod(self) -> _mask_mod_signature:
+        assert self.doc_ids is not None
+        cross_batch = self.cross_batch_attention_metadata
+        assert cross_batch is not None
+
+        def final_mask_mod(
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            physical_kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            q_req = self.doc_ids[q_idx]
+            physical_kv_block = physical_kv_idx // self.block_size
+            physical_kv_offset = physical_kv_idx % self.block_size
+
+            same_logical_block_idx = self.physical_to_logical[
+                q_req, physical_kv_block
+            ]
+            same_logical_kv_idx = (
+                same_logical_block_idx * self.block_size + physical_kv_offset
+            )
+            same_valid = (
+                (same_logical_block_idx >= 0)
+                & (same_logical_kv_idx >= 0)
+                & (same_logical_kv_idx < self.seq_lens[q_req])
+            )
+
+            local_q_idx = q_idx - self.query_start_loc[q_req]
+            logical_q_idx = local_q_idx + self.decode_offset[q_req]
+            same_allowed = same_valid & self.logical_mask_mod(
+                b, h, logical_q_idx, same_logical_kv_idx
+            )
+
+            peer_batches = cross_batch.allowed_peer_batches[q_req]
+            peer_mask = cross_batch.allowed_peer_mask[q_req]
+            safe_peer_batches = torch.where(peer_mask, peer_batches, 0)
+            peer_logical_block_idx = self.physical_to_logical[
+                safe_peer_batches, physical_kv_block.unsqueeze(-1)
+            ]
+            peer_logical_kv_idx = (
+                peer_logical_block_idx * self.block_size
+                + physical_kv_offset.unsqueeze(-1)
+            )
+            peer_valid = (
+                peer_mask
+                & (peer_logical_block_idx >= 0)
+                & (peer_logical_kv_idx >= 0)
+                & (peer_logical_kv_idx < self.seq_lens[safe_peer_batches])
+            )
+
+            safe_q_idx = torch.clamp(logical_q_idx, min=0)
+            safe_peer_kv_idx = torch.clamp(peer_logical_kv_idx, min=0)
+            virtual_token_id = cross_batch.virtual_token_ids[q_req]
+            q_is_virtual = (
+                cross_batch.token_ids[q_req, safe_q_idx] == virtual_token_id
+            )
+            peer_kv_is_virtual = (
+                cross_batch.token_ids[safe_peer_batches, safe_peer_kv_idx]
+                == virtual_token_id
+            )
+            virtual_window_size = cross_batch.virtual_window_sizes[q_req]
+            q_virtual_idx = logical_q_idx % virtual_window_size
+            peer_virtual_idx = peer_logical_kv_idx % virtual_window_size
+            peer_allowed = (
+                peer_valid
+                & q_is_virtual.unsqueeze(-1)
+                & peer_kv_is_virtual
+                & (q_virtual_idx.unsqueeze(-1) >= peer_virtual_idx)
+            )
+
+            return same_allowed | peer_allowed.any(dim=-1)
 
         return final_mask_mod
 
@@ -502,13 +578,18 @@ class FlexAttentionMetadata:
     def get_mask_mod(self):
         # Stage-1: initialize the base mask_mod
         # (causal mask for decoder or bidirectional mask for encoder)
-        if self.causal:
+        if self.causal and self.cross_batch_attention_metadata is not None:
+            mask_mod = self.get_cross_batch_mask_mod()
+        elif self.causal:
             mask_mod = self.get_causal_mask_mod()
         else:
             mask_mod = self.get_bidirectional_mask_mod()
         # stage-2: add external mask_mod for special attention during
         # forwarding runtime to create the combined mask_mod.
-        if self.sliding_window is not None:
+        if (
+            self.sliding_window is not None
+            and self.cross_batch_attention_metadata is None
+        ):
             # Add sliding window mask for sliding window attention
             sliding_window_mask_mod = self.get_sliding_window_mask_mod()
             mask_mod = and_masks(mask_mod, sliding_window_mask_mod)
@@ -587,9 +668,13 @@ class FlexAttentionMetadata:
 
         used_pages = self.block_table[
             self.doc_ids, : cdiv(self.max_seq_len, self.block_size)
-        ]
+        ].clone()
 
-        if self.sliding_window and self.causal:
+        if (
+            self.sliding_window
+            and self.causal
+            and self.cross_batch_attention_metadata is None
+        ):
             device = used_pages.device
             assert self.doc_ids is not None
             token_indices = torch.arange(
@@ -604,6 +689,19 @@ class FlexAttentionMetadata:
             min_block_idx = min_kv_idx // self.block_size
             sliding_mask = self.logical_block_ids >= min_block_idx[:, None]
             used_pages.masked_fill_(~sliding_mask, 0)
+
+        if self.cross_batch_attention_metadata is not None:
+            cross_batch = self.cross_batch_attention_metadata
+            peer_batches = cross_batch.allowed_peer_batches[self.doc_ids]
+            peer_mask = cross_batch.allowed_peer_mask[self.doc_ids]
+            safe_peer_batches = torch.where(peer_mask, peer_batches, 0)
+            peer_pages = self.block_table[
+                safe_peer_batches, : cdiv(self.max_seq_len, self.block_size)
+            ]
+            peer_pages = torch.where(peer_mask[..., None], peer_pages, 0)
+            used_pages = torch.cat(
+                (used_pages, peer_pages.flatten(start_dim=1)), dim=1
+            )
 
         used_pages_padded = pad_to_multiple(
             used_pages, multiple=self.q_block_size, dim=0
@@ -756,6 +854,9 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             direct_build=(self.direct_build and common_attn_metadata.causal),
             q_block_size=self.q_block_size,
             kv_block_size=self.kv_block_size,
+            cross_batch_attention_metadata=(
+                common_attn_metadata.cross_batch_attention_metadata
+            ),
         )
         return out
 
