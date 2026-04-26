@@ -812,29 +812,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             virtual_token_ids_np[batch_idx] = params.virtual_token_id
             virtual_window_sizes_np[batch_idx] = params.virtual_window_size
 
-        allowed_peer_batches_np = np.full((num_reqs, num_reqs), -1, dtype=np.int32)
-        allowed_peer_mask_np = np.zeros((num_reqs, num_reqs), dtype=np.bool_)
-        for query_batch in range(num_reqs):
-            if not enabled_np[query_batch]:
+        num_groups = len(group_name_to_id)
+        group_counts = np.zeros(num_groups, dtype=np.int32)
+        for batch_idx in range(num_reqs):
+            if enabled_np[batch_idx]:
+                group_counts[group_ids_np[batch_idx]] += 1
+        max_group_members = int(group_counts.max()) if num_groups else 1
+        group_members_np = np.full(
+            (max(num_groups, 1), max_group_members), -1, dtype=np.int32
+        )
+        group_member_mask_np = np.zeros(
+            (max(num_groups, 1), max_group_members), dtype=np.bool_
+        )
+        group_write_offsets = np.zeros(max(num_groups, 1), dtype=np.int32)
+        for batch_idx in range(num_reqs):
+            if not enabled_np[batch_idx]:
                 continue
-            peer_write_idx = 0
-            for peer_batch in range(num_reqs):
-                if query_batch == peer_batch or not enabled_np[peer_batch]:
-                    continue
-                if group_ids_np[query_batch] != group_ids_np[peer_batch]:
-                    continue
-                allowed_peer_batches_np[query_batch, peer_write_idx] = peer_batch
-                allowed_peer_mask_np[query_batch, peer_write_idx] = True
-                peer_write_idx += 1
+            group_id = group_ids_np[batch_idx]
+            write_idx = group_write_offsets[group_id]
+            group_members_np[group_id, write_idx] = batch_idx
+            group_member_mask_np[group_id, write_idx] = True
+            group_write_offsets[group_id] += 1
 
         return CrossBatchAttentionMetadata(
             enabled=async_copy_to_gpu(enabled_np, device=device),
             group_ids=async_copy_to_gpu(group_ids_np, device=device),
             replica_ids=async_copy_to_gpu(replica_ids_np, device=device),
-            allowed_peer_batches=async_copy_to_gpu(
-                allowed_peer_batches_np, device=device
-            ),
-            allowed_peer_mask=async_copy_to_gpu(allowed_peer_mask_np, device=device),
+            group_members=async_copy_to_gpu(group_members_np, device=device),
+            group_member_mask=async_copy_to_gpu(group_member_mask_np, device=device),
             virtual_token_ids=async_copy_to_gpu(virtual_token_ids_np, device=device),
             virtual_window_sizes=async_copy_to_gpu(
                 virtual_window_sizes_np, device=device

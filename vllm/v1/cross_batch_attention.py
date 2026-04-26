@@ -107,9 +107,8 @@ class CrossBatchAttentionMetadata:
     enabled: torch.Tensor
     group_ids: torch.Tensor
     replica_ids: torch.Tensor
-    allowed_peer_batches: torch.Tensor
-    allowed_peer_mask: torch.Tensor
+    group_members: torch.Tensor
+    group_member_mask: torch.Tensor
     virtual_token_ids: torch.Tensor
     virtual_window_sizes: torch.Tensor
     token_ids: torch.Tensor
-

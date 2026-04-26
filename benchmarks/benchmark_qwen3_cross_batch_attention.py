@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.tokenizers import get_tokenizer
+from vllm.v1.cba_profile import log_event
 
 
 def build_prompt_ids(tokenizer, prompt_len: int, variant: int) -> list[int]:
@@ -59,6 +60,15 @@ def make_sampling_params(
 
 def run_case(llm, tokenizer, mode, groups, group_size, prompt_len, max_tokens, repeats):
     num_reqs = groups * group_size
+    case_fields = {
+        "mode": mode,
+        "groups": groups,
+        "group_size": group_size,
+        "num_reqs": num_reqs,
+        "prompt_len": prompt_len,
+        "max_tokens": max_tokens,
+    }
+    log_event("bench.case_start", **case_fields)
     prompts = [
         TokensPrompt(prompt_token_ids=build_prompt_ids(tokenizer, prompt_len, i))
         for i in range(num_reqs)
@@ -72,11 +82,14 @@ def run_case(llm, tokenizer, mode, groups, group_size, prompt_len, max_tokens, r
     )
 
     # Warmup for this exact shape/topology.
+    log_event("bench.warmup_start", **case_fields)
     llm.generate(prompts, params, use_tqdm=False)
     torch.cuda.synchronize()
+    log_event("bench.warmup_end", **case_fields)
 
     trials = []
-    for _ in range(repeats):
+    for trial_idx in range(repeats):
+        log_event("bench.trial_start", trial_idx=trial_idx, **case_fields)
         start = time.perf_counter()
         outputs = llm.generate(prompts, params, use_tqdm=False)
         torch.cuda.synchronize()
@@ -92,8 +105,17 @@ def run_case(llm, tokenizer, mode, groups, group_size, prompt_len, max_tokens, r
                 "total_tok_s": (prompt_tokens + output_tokens) / elapsed,
             }
         )
+        log_event(
+            "bench.trial_end",
+            trial_idx=trial_idx,
+            elapsed_s=elapsed,
+            output_tokens=output_tokens,
+            output_tok_s=output_tokens / elapsed,
+            **case_fields,
+        )
     output_rates = [trial["output_tok_s"] for trial in trials]
     total_rates = [trial["total_tok_s"] for trial in trials]
+    log_event("bench.case_end", **case_fields)
     return {
         "mode": mode,
         "groups": groups,

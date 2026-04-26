@@ -3,6 +3,8 @@
 """Attention layer with FlexAttention."""
 
 import math
+import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import cached_property
 from typing import ClassVar
@@ -37,10 +39,12 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     is_quantized_kv_cache,
 )
+from vllm.v1.cba_profile import cuda_timer, enabled as cba_profile_enabled, log_event
 from vllm.v1.cross_batch_attention import CrossBatchAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+_CBA_PROFILE_ATTENTION_CALLS = 0
 
 torch._dynamo.config.recompile_limit = 16
 create_block_mask_compiled = torch.compile(
@@ -335,6 +339,8 @@ class FlexAttentionMetadata:
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     cross_batch_attention_metadata: CrossBatchAttentionMetadata | None = None
+    group_physical_to_logical: torch.Tensor | None = None
+    group_physical_owner_batch: torch.Tensor | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -378,6 +384,56 @@ class FlexAttentionMetadata:
 
         return is_valid, logical_q_idx, logical_kv_idx
 
+    def _ensure_cross_batch_group_maps(self) -> None:
+        cross_batch = self.cross_batch_attention_metadata
+        if cross_batch is None or getattr(self, "group_physical_to_logical", None) is not None:
+            return
+
+        num_groups = int(cross_batch.group_members.shape[0])
+        total_blocks = int(self.physical_to_logical.shape[1])
+        device = self.physical_to_logical.device
+        group_physical_to_logical = torch.full(
+            (num_groups, total_blocks), -1, dtype=torch.long, device=device
+        )
+        group_physical_owner_batch = torch.full(
+            (num_groups, total_blocks),
+            self.physical_to_logical.shape[0],
+            dtype=torch.long,
+            device=device,
+        )
+
+        req_group_ids = torch.clamp(cross_batch.group_ids, min=0).to(torch.long)
+        group_index = req_group_ids[:, None].expand_as(self.physical_to_logical)
+        valid = cross_batch.enabled[:, None] & (self.physical_to_logical >= 0)
+        logical_src = torch.where(
+            valid,
+            self.physical_to_logical,
+            torch.full_like(self.physical_to_logical, -1),
+        )
+        group_physical_to_logical.scatter_reduce_(
+            0, group_index, logical_src, reduce="amax", include_self=True
+        )
+
+        batch_ids = torch.arange(
+            self.physical_to_logical.shape[0], device=device, dtype=torch.long
+        )[:, None].expand_as(self.physical_to_logical)
+        owner_src = torch.where(
+            valid,
+            batch_ids,
+            torch.full_like(batch_ids, self.physical_to_logical.shape[0]),
+        )
+        group_physical_owner_batch.scatter_reduce_(
+            0, group_index, owner_src, reduce="amin", include_self=True
+        )
+        group_physical_owner_batch = torch.where(
+            group_physical_to_logical >= 0,
+            group_physical_owner_batch,
+            torch.zeros_like(group_physical_owner_batch),
+        )
+
+        self.group_physical_to_logical = group_physical_to_logical
+        self.group_physical_owner_batch = group_physical_owner_batch
+
     def get_causal_mask_mod(self) -> _mask_mod_signature:
         """Creates the mask_mod function for FlexAttention.
 
@@ -414,6 +470,9 @@ class FlexAttentionMetadata:
         assert self.doc_ids is not None
         cross_batch = self.cross_batch_attention_metadata
         assert cross_batch is not None
+        self._ensure_cross_batch_group_maps()
+        assert self.group_physical_to_logical is not None
+        assert self.group_physical_owner_batch is not None
 
         def final_mask_mod(
             b: torch.Tensor,
@@ -458,46 +517,49 @@ class FlexAttentionMetadata:
                 & (cross_batch.token_ids[q_req, safe_q_idx] == virtual_token_id)
             )
             q_is_virtual = q_is_virtual_by_position | q_is_virtual_by_token
-            peer_allowed = same_allowed & False
-            for peer_idx in range(cross_batch.allowed_peer_batches.shape[1]):
-                peer_batch = cross_batch.allowed_peer_batches[:, peer_idx][q_req]
-                peer_mask = cross_batch.allowed_peer_mask[:, peer_idx][q_req]
-                safe_peer_batch = torch.where(peer_mask, peer_batch, 0)
-                peer_logical_block_idx = self.physical_to_logical[
-                    safe_peer_batch, physical_kv_block
-                ]
-                peer_logical_kv_idx = (
-                    peer_logical_block_idx * self.block_size + physical_kv_offset
+
+            q_enabled = cross_batch.enabled[q_req]
+            safe_group_id = torch.clamp(cross_batch.group_ids[q_req], min=0).to(
+                torch.long
+            )
+            group_logical_block_idx = self.group_physical_to_logical[
+                safe_group_id, physical_kv_block
+            ]
+            group_owner_batch = self.group_physical_owner_batch[
+                safe_group_id, physical_kv_block
+            ]
+            group_logical_kv_idx = (
+                group_logical_block_idx * self.block_size + physical_kv_offset
+            )
+            group_valid = (
+                q_enabled
+                & (group_logical_block_idx >= 0)
+                & (group_logical_kv_idx >= 0)
+                & (group_logical_kv_idx < self.seq_lens[group_owner_batch])
+            )
+            safe_group_kv_idx = torch.clamp(group_logical_kv_idx, min=0)
+            group_kv_is_virtual_by_position = (
+                (virtual_token_id < 0)
+                & (virtual_window_size > 0)
+                & (group_logical_kv_idx >= 0)
+                & ((group_logical_kv_idx % virtual_stride) == virtual_window_size)
+            )
+            group_kv_is_virtual_by_token = (
+                (virtual_token_id >= 0)
+                & (
+                    cross_batch.token_ids[group_owner_batch, safe_group_kv_idx]
+                    == virtual_token_id
                 )
-                peer_valid = (
-                    peer_mask
-                    & (peer_logical_block_idx >= 0)
-                    & (peer_logical_kv_idx >= 0)
-                    & (peer_logical_kv_idx < self.seq_lens[safe_peer_batch])
-                )
-                safe_peer_kv_idx = torch.clamp(peer_logical_kv_idx, min=0)
-                peer_kv_is_virtual_by_position = (
-                    (virtual_token_id < 0)
-                    & (virtual_window_size > 0)
-                    & (peer_logical_kv_idx >= 0)
-                    & ((peer_logical_kv_idx % virtual_stride) == virtual_window_size)
-                )
-                peer_kv_is_virtual_by_token = (
-                    (virtual_token_id >= 0)
-                    & (
-                        cross_batch.token_ids[safe_peer_batch, safe_peer_kv_idx]
-                        == virtual_token_id
-                    )
-                )
-                peer_kv_is_virtual = (
-                    peer_kv_is_virtual_by_position | peer_kv_is_virtual_by_token
-                )
-                peer_allowed = peer_allowed | (
-                    peer_valid
-                    & q_is_virtual
-                    & peer_kv_is_virtual
-                    & (logical_q_idx >= peer_logical_kv_idx)
-                )
+            )
+            group_kv_is_virtual = (
+                group_kv_is_virtual_by_position | group_kv_is_virtual_by_token
+            )
+            peer_allowed = (
+                group_valid
+                & q_is_virtual
+                & group_kv_is_virtual
+                & (logical_q_idx >= group_logical_kv_idx)
+            )
 
             return same_allowed | peer_allowed
 
@@ -685,69 +747,113 @@ class FlexAttentionMetadata:
                 f"configuration."
             )
 
-        used_pages = self.block_table[
-            self.doc_ids, : cdiv(self.max_seq_len, self.block_size)
-        ].clone()
-
-        if (
-            self.sliding_window
-            and self.causal
-            and self.cross_batch_attention_metadata is None
+        profile_on = cba_profile_enabled()
+        with cuda_timer(
+            "flex.block_mask_direct",
+            cross_batch=self.cross_batch_attention_metadata is not None,
+            num_actual_tokens=int(self.num_actual_tokens),
+            total_cache_tokens=int(self.total_cache_tokens),
+            max_seq_len=int(self.max_seq_len),
+            q_block_size=int(self.q_block_size),
+            kv_block_size=int(self.kv_block_size),
         ):
-            device = used_pages.device
-            assert self.doc_ids is not None
-            token_indices = torch.arange(
-                self.doc_ids.shape[0], device=device, dtype=torch.long
+            used_pages = self.block_table[
+                self.doc_ids, : cdiv(self.max_seq_len, self.block_size)
+            ].clone()
+
+            if (
+                self.sliding_window
+                and self.causal
+                and self.cross_batch_attention_metadata is None
+            ):
+                device = used_pages.device
+                assert self.doc_ids is not None
+                token_indices = torch.arange(
+                    self.doc_ids.shape[0], device=device, dtype=torch.long
+                )
+                logical_q_idx = (
+                    token_indices
+                    - self.query_start_loc[self.doc_ids]
+                    + self.decode_offset[self.doc_ids]
+                )
+                min_kv_idx = torch.clamp(
+                    logical_q_idx - (self.sliding_window - 1), min=0
+                )
+                min_block_idx = min_kv_idx // self.block_size
+                sliding_mask = self.logical_block_ids >= min_block_idx[:, None]
+                used_pages.masked_fill_(~sliding_mask, 0)
+
+            peer_width = 0
+            peer_entries = 0
+            peer_pages_shape = None
+            if self.cross_batch_attention_metadata is not None:
+                cross_batch = self.cross_batch_attention_metadata
+                doc_enabled = cross_batch.enabled[self.doc_ids]
+                safe_group_ids = torch.clamp(
+                    cross_batch.group_ids[self.doc_ids], min=0
+                ).to(torch.long)
+                member_batches = cross_batch.group_members[safe_group_ids]
+                member_mask = (
+                    cross_batch.group_member_mask[safe_group_ids]
+                    & doc_enabled[:, None]
+                    & (member_batches != self.doc_ids[:, None])
+                )
+                safe_member_batches = torch.where(member_mask, member_batches, 0)
+                peer_width = int(member_mask.shape[1])
+                if profile_on:
+                    peer_entries = int(member_mask.sum().item())
+                peer_pages = self.block_table[
+                    safe_member_batches, : cdiv(self.max_seq_len, self.block_size)
+                ]
+                peer_pages_shape = tuple(peer_pages.shape)
+                peer_pages = torch.where(member_mask[..., None], peer_pages, 0)
+                used_pages = torch.cat(
+                    (used_pages, peer_pages.flatten(start_dim=1)), dim=1
+                )
+
+            used_pages_shape = tuple(used_pages.shape)
+            used_pages_padded = pad_to_multiple(
+                used_pages, multiple=self.q_block_size, dim=0
             )
-            logical_q_idx = (
-                token_indices
-                - self.query_start_loc[self.doc_ids]
-                + self.decode_offset[self.doc_ids]
+            used_pages_padded = used_pages_padded.reshape(
+                used_pages_padded.shape[0] // self.q_block_size, -1
             )
-            min_kv_idx = torch.clamp(logical_q_idx - (self.sliding_window - 1), min=0)
-            min_block_idx = min_kv_idx // self.block_size
-            sliding_mask = self.logical_block_ids >= min_block_idx[:, None]
-            used_pages.masked_fill_(~sliding_mask, 0)
+            used_pages_padded = used_pages_padded // page_to_block_ratio
+            kv_indices = unique_static_unsorted(
+                (used_pages_padded.long()), M=self.num_blocks
+            ).to(torch.int32)
 
-        if self.cross_batch_attention_metadata is not None:
-            cross_batch = self.cross_batch_attention_metadata
-            peer_batches = cross_batch.allowed_peer_batches[self.doc_ids]
-            peer_mask = cross_batch.allowed_peer_mask[self.doc_ids]
-            safe_peer_batches = torch.where(peer_mask, peer_batches, 0)
-            peer_pages = self.block_table[
-                safe_peer_batches, : cdiv(self.max_seq_len, self.block_size)
-            ]
-            peer_pages = torch.where(peer_mask[..., None], peer_pages, 0)
-            used_pages = torch.cat(
-                (used_pages, peer_pages.flatten(start_dim=1)), dim=1
-            )
+            kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
+            if profile_on:
+                kv_blocks_cpu = kv_num_blocks.detach().cpu()
+                log_event(
+                    "flex.block_mask_direct_stats",
+                    cross_batch=self.cross_batch_attention_metadata is not None,
+                    used_pages_shape=used_pages_shape,
+                    peer_width=peer_width,
+                    peer_entries=peer_entries,
+                    peer_pages_shape=peer_pages_shape,
+                    kv_blocks_min=int(kv_blocks_cpu.min().item()),
+                    kv_blocks_max=int(kv_blocks_cpu.max().item()),
+                    kv_blocks_mean=float(kv_blocks_cpu.float().mean().item()),
+                    kv_blocks_sum=int(kv_blocks_cpu.sum().item()),
+                )
 
-        used_pages_padded = pad_to_multiple(
-            used_pages, multiple=self.q_block_size, dim=0
-        )
-        used_pages_padded = used_pages_padded.reshape(
-            used_pages_padded.shape[0] // self.q_block_size, -1
-        )
-        used_pages_padded = used_pages_padded // page_to_block_ratio
-        kv_indices = unique_static_unsorted(
-            (used_pages_padded.long()), M=self.num_blocks
-        ).to(torch.int32)
+            block_mask_kwargs = {
+                "seq_lengths": (self.num_actual_tokens, self.total_cache_tokens),
+                "kv_num_blocks": kv_num_blocks[None, None],
+                "kv_indices": kv_indices[None, None],
+                "full_kv_num_blocks": None,
+                "full_kv_indices": None,
+                "BLOCK_SIZE": (self.q_block_size, self.kv_block_size),
+                "mask_mod": self.mask_mod,
+            }
 
-        kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
-        block_mask_kwargs = {
-            "seq_lengths": (self.num_actual_tokens, self.total_cache_tokens),
-            "kv_num_blocks": kv_num_blocks[None, None],
-            "kv_indices": kv_indices[None, None],
-            "full_kv_num_blocks": None,
-            "full_kv_indices": None,
-            "BLOCK_SIZE": (self.q_block_size, self.kv_block_size),
-            "mask_mod": self.mask_mod,
-        }
-
-        # compute_q_blocks parameter is available in PyTorch 2.9+
-        if is_torch_equal_or_newer("2.9.0.dev0"):
-            block_mask_kwargs["compute_q_blocks"] = False
-        return BlockMask.from_kv_blocks(**block_mask_kwargs)
+            # compute_q_blocks parameter is available in PyTorch 2.9+
+            if is_torch_equal_or_newer("2.9.0.dev0"):
+                block_mask_kwargs["compute_q_blocks"] = False
+            block_mask = BlockMask.from_kv_blocks(**block_mask_kwargs)
+        return block_mask
 
     def build_block_mask(self) -> BlockMask:
         mask_mod = self.get_mask_mod()
@@ -1072,16 +1178,40 @@ class FlexAttentionImpl(AttentionImpl):
         kernel_options = get_kernel_options(
             query, block_m, block_n, attn_metadata.direct_build
         )
-        out = flex_attention_compiled(
-            query,
-            key_tensor,
-            value_tensor,
-            attn_metadata.transformed_score_mod,
-            attn_metadata.block_mask,
-            self.scale,
-            enable_gqa=enable_gqa,
-            kernel_options=kernel_options,
+        global _CBA_PROFILE_ATTENTION_CALLS
+        profile_on = cba_profile_enabled()
+        if profile_on:
+            _CBA_PROFILE_ATTENTION_CALLS += 1
+            log_every = int(os.environ.get("VLLM_CBA_PROFILE_ATTENTION_LOG_EVERY", "1"))
+            should_time_attention = (
+                _CBA_PROFILE_ATTENTION_CALLS % max(log_every, 1) == 0
+            )
+        else:
+            should_time_attention = False
+
+        timer = cuda_timer(
+            "flex.attention",
+            cross_batch=attn_metadata.cross_batch_attention_metadata is not None,
+            num_actual_tokens=int(num_actual_tokens),
+            total_cache_tokens=int(attn_metadata.total_cache_tokens),
+            max_seq_len=int(attn_metadata.max_seq_len),
+            block_m=int(block_m),
+            block_n=int(block_n),
+            direct_build=bool(attn_metadata.direct_build),
         )
+        if not should_time_attention:
+            timer = nullcontext()
+        with timer:
+            out = flex_attention_compiled(
+                query,
+                key_tensor,
+                value_tensor,
+                attn_metadata.transformed_score_mod,
+                attn_metadata.block_mask,
+                self.scale,
+                enable_gqa=enable_gqa,
+                kernel_options=kernel_options,
+            )
 
         # Flex doesn't have an out variant today, rely on epilogue fusion
         out = out.permute(0, 2, 1, 3).squeeze(0)

@@ -21,7 +21,7 @@ Benchmarks:
 - `flex`: normal non-cross-batch FlexAttention baseline.
 - `flashattn`: normal non-cross-batch FlashAttention v2 baseline.
 
-Output-token throughput:
+Output-token throughput, original peer-loop prototype:
 
 | prompt | decode | groups | reqs | crossbatch tok/s | flex tok/s | flashattn tok/s | flash/flex | cross/flash |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -38,6 +38,24 @@ Output-token throughput:
 | 512 | 256 | 2 | 8 | 79.93 | 456.77 | 832.12 | 1.82x | 9.61% |
 | 512 | 256 | 4 | 16 | 41.16 | 515.04 | 1631.70 | 3.17x | 2.52% |
 
+Output-token throughput after replacing the request-by-request peer matrix with
+group-scoped physical-block lookup:
+
+| prompt | decode | groups | reqs | crossbatch physical tok/s | flex tok/s | flashattn tok/s | cross/flex | cross/flash |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | 64 | 1 | 4 | 255.82 | 280.22 | 420.33 | 91.29% | 60.86% |
+| 128 | 64 | 2 | 8 | 498.16 | 543.52 | 839.05 | 91.65% | 59.37% |
+| 128 | 64 | 4 | 16 | 746.54 | 1082.76 | 1643.38 | 68.95% | 45.43% |
+| 128 | 256 | 1 | 4 | 262.17 | 276.11 | 428.74 | 94.95% | 61.15% |
+| 128 | 256 | 2 | 8 | 445.37 | 553.12 | 851.05 | 80.52% | 52.33% |
+| 128 | 256 | 4 | 16 | 532.34 | 998.79 | 1690.48 | 53.30% | 31.49% |
+| 512 | 64 | 1 | 4 | 182.10 | 272.04 | 435.24 | 66.94% | 41.84% |
+| 512 | 64 | 2 | 8 | 222.08 | 494.18 | 838.20 | 44.94% | 26.50% |
+| 512 | 64 | 4 | 16 | 233.87 | 566.20 | 1589.73 | 41.31% | 14.71% |
+| 512 | 256 | 1 | 4 | 184.12 | 278.89 | 418.27 | 66.02% | 44.02% |
+| 512 | 256 | 2 | 8 | 219.24 | 457.70 | 832.12 | 47.90% | 26.35% |
+| 512 | 256 | 4 | 16 | 229.61 | 515.45 | 1631.70 | 44.54% | 14.07% |
+
 Capacity notes:
 
 - Crossbatch ran at 5 groups / 20 requests for prompt 128, decode 64:
@@ -48,10 +66,13 @@ Capacity notes:
   `Required: 221696 Hardware limit: 166912`.
 - These failures are FlexAttention Triton kernel-resource limits, not KV-cache
   capacity exhaustion.
+- After the physical-block lookup change, crossbatch ran at 6 groups / 24
+  requests for prompt 128, decode 64: `1103.27` output tok/s.
 
 Raw result files:
 
 - `qwen3_0_6b_a100_flex_crossbatch_2026-04-26.json`
+- `qwen3_0_6b_a100_flex_crossbatch_physical_lookup_2026-04-26.json`
 - `qwen3_0_6b_a100_flashattn_baseline_2026-04-26.json`
 - `qwen3_0_6b_a100_crossbatch_capacity_g5_2026-04-26.json`
 - `qwen3_0_6b_a100_crossbatch_capacity_g6_failed_2026-04-26.json`

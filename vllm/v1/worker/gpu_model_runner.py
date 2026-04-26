@@ -126,6 +126,12 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.cba_profile import (
+    cpu_timer,
+    cuda_timer,
+    enabled as cba_profile_enabled,
+    log_event,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cross_batch_attention import CrossBatchAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -1977,13 +1983,18 @@ class GPUModelRunner(
             causal=True,
         )
         if scheduler_output is not None:
-            cm_base.cross_batch_attention_metadata = (
-                self._make_cross_batch_attention_metadata(
+            with cpu_timer(
+                "runner.cross_batch_metadata",
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+            ):
+                cm_base.cross_batch_attention_metadata = (
+                    self._make_cross_batch_attention_metadata(
                     scheduler_output=scheduler_output,
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded,
+                    )
                 )
-            )
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -2179,22 +2190,38 @@ class GPUModelRunner(
             virtual_token_ids_np[batch_idx] = params.virtual_token_id
             virtual_window_sizes_np[batch_idx] = params.virtual_window_size
 
-        allowed_peer_batches_np = np.full(
-            (num_reqs_padded, num_reqs_padded), -1, dtype=np.int32
+        num_groups = len(group_name_to_id)
+        group_counts = np.zeros(num_groups, dtype=np.int32)
+        for batch_idx in range(num_reqs):
+            if enabled_np[batch_idx]:
+                group_counts[group_ids_np[batch_idx]] += 1
+        max_group_members = int(group_counts.max()) if num_groups else 1
+        group_members_np = np.full(
+            (max(num_groups, 1), max_group_members), -1, dtype=np.int32
         )
-        allowed_peer_mask_np = np.zeros((num_reqs_padded, num_reqs_padded), dtype=bool)
-        for query_batch in range(num_reqs):
-            if not enabled_np[query_batch]:
+        group_member_mask_np = np.zeros(
+            (max(num_groups, 1), max_group_members), dtype=bool
+        )
+        group_write_offsets = np.zeros(max(num_groups, 1), dtype=np.int32)
+        for batch_idx in range(num_reqs):
+            if not enabled_np[batch_idx]:
                 continue
-            peer_write_idx = 0
-            for peer_batch in range(num_reqs):
-                if query_batch == peer_batch or not enabled_np[peer_batch]:
-                    continue
-                if group_ids_np[query_batch] != group_ids_np[peer_batch]:
-                    continue
-                allowed_peer_batches_np[query_batch, peer_write_idx] = peer_batch
-                allowed_peer_mask_np[query_batch, peer_write_idx] = True
-                peer_write_idx += 1
+            group_id = group_ids_np[batch_idx]
+            write_idx = group_write_offsets[group_id]
+            group_members_np[group_id, write_idx] = batch_idx
+            group_member_mask_np[group_id, write_idx] = True
+            group_write_offsets[group_id] += 1
+
+        if cba_profile_enabled():
+            log_event(
+                "runner.cross_batch_metadata_stats",
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                enabled_reqs=int(enabled_np[:num_reqs].sum()),
+                group_members_shape=group_members_np.shape,
+                group_member_entries=int(group_member_mask_np.sum()),
+                max_group_members=max_group_members,
+            )
 
         return CrossBatchAttentionMetadata(
             enabled=torch.tensor(enabled_np, dtype=torch.bool, device=self.device),
@@ -2202,11 +2229,11 @@ class GPUModelRunner(
             replica_ids=torch.tensor(
                 replica_ids_np, dtype=torch.int32, device=self.device
             ),
-            allowed_peer_batches=torch.tensor(
-                allowed_peer_batches_np, dtype=torch.int32, device=self.device
+            group_members=torch.tensor(
+                group_members_np, dtype=torch.int32, device=self.device
             ),
-            allowed_peer_mask=torch.tensor(
-                allowed_peer_mask_np, dtype=torch.bool, device=self.device
+            group_member_mask=torch.tensor(
+                group_member_mask_np, dtype=torch.bool, device=self.device
             ),
             virtual_token_ids=torch.tensor(
                 virtual_token_ids_np, dtype=torch.int32, device=self.device
@@ -3666,7 +3693,12 @@ class GPUModelRunner(
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
-            self._update_states(scheduler_output)
+            with cpu_timer(
+                "runner.update_states",
+                cross_batch=scheduler_output.cross_batch_attention_data is not None,
+                scheduled_tokens=int(num_scheduled_tokens),
+            ):
+                self._update_states(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -3708,10 +3740,17 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
-            )
+            with cpu_timer(
+                "runner.prepare_inputs",
+                cross_batch=scheduler_output.cross_batch_attention_data is not None,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens_unpadded,
+                max_query_len=max_num_scheduled_tokens,
+            ):
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -3723,21 +3762,28 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
-            (
-                cudagraph_mode,
-                batch_desc,
-                should_ubatch,
-                num_tokens_across_dp,
-                cudagraph_stats,
-            ) = self._determine_batch_execution_and_padding(
-                num_tokens=num_tokens_unpadded,
+            with cpu_timer(
+                "runner.determine_batch",
+                cross_batch=scheduler_output.cross_batch_attention_data is not None,
                 num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens_np,
-                max_num_scheduled_tokens=max_num_scheduled_tokens,
-                use_cascade_attn=cascade_attn_prefix_lens is not None,
-                force_eager=scheduler_output.cross_batch_attention_data is not None,
-                num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-            )
+                num_tokens=num_tokens_unpadded,
+                max_query_len=max_num_scheduled_tokens,
+            ):
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    force_eager=scheduler_output.cross_batch_attention_data is not None,
+                    num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                )
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -3795,44 +3841,65 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
-                else num_tokens_unpadded,
-                num_reqs_padded=(
-                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
-                ),
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=ubatch_slices_padded,
-            )
-
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=max_num_scheduled_tokens,
-                    ubatch_slices=ubatch_slices_attn,
-                    logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
-                    scheduler_output=scheduler_output,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                    slot_mappings=slot_mappings_by_group,
+            with cpu_timer(
+                "runner.slot_mappings",
+                cross_batch=scheduler_output.cross_batch_attention_data is not None,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens_unpadded,
+            ):
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded
+                    if pad_attn or has_separate_kv_update
+                    else num_tokens_unpadded,
+                    num_reqs_padded=(
+                        num_reqs_padded
+                        if pad_attn or has_separate_kv_update
+                        else num_reqs
+                    ),
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_padded,
                 )
-            )
 
-            (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
-            )
+            with cuda_timer(
+                "runner.build_attention_metadata",
+                cross_batch=scheduler_output.cross_batch_attention_data is not None,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens_unpadded,
+                max_query_len=max_num_scheduled_tokens,
+            ):
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded if pad_attn else None,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded if pad_attn else None,
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        scheduler_output=scheduler_output,
+                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        slot_mappings=slot_mappings_by_group,
+                    )
+                )
+
+            with cpu_timer(
+                "runner.preprocess",
+                cross_batch=scheduler_output.cross_batch_attention_data is not None,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens_unpadded,
+            ):
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(
+                    scheduler_output, num_tokens_padded, intermediate_tensors
+                )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3872,13 +3939,21 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            with cuda_timer(
+                "runner.model_forward",
+                cross_batch=scheduler_output.cross_batch_attention_data is not None,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens_unpadded,
+                max_query_len=max_num_scheduled_tokens,
+                cudagraph_mode=str(cudagraph_mode),
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

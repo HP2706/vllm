@@ -244,20 +244,11 @@ def test_cross_batch_block_mask_direct_vs_slow_path():
         enabled=torch.tensor([True, True, True, True, False], device=device),
         group_ids=torch.tensor([0, 1, 0, 1, -1], dtype=torch.int32, device=device),
         replica_ids=torch.tensor([0, 0, 1, 1, -1], dtype=torch.int32, device=device),
-        allowed_peer_batches=torch.tensor(
-            [[2, -1], [3, -1], [0, -1], [1, -1], [-1, -1]],
-            dtype=torch.int32,
-            device=device,
+        group_members=torch.tensor(
+            [[0, 2], [1, 3]], dtype=torch.int32, device=device
         ),
-        allowed_peer_mask=torch.tensor(
-            [
-                [True, False],
-                [True, False],
-                [True, False],
-                [True, False],
-                [False, False],
-            ],
-            device=device,
+        group_member_mask=torch.tensor(
+            [[True, True], [True, True]], device=device
         ),
         virtual_token_ids=torch.tensor(
             [99, 99, 99, 99, 99], dtype=torch.int32, device=device

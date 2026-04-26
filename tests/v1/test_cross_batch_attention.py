@@ -197,8 +197,8 @@ def make_flex_metadata_for_mask(token_ids: torch.Tensor) -> FlexAttentionMetadat
         enabled=torch.tensor([True, True]),
         group_ids=torch.tensor([0, 0], dtype=torch.int32),
         replica_ids=torch.tensor([0, 1], dtype=torch.int32),
-        allowed_peer_batches=torch.tensor([[1, -1], [0, -1]], dtype=torch.int32),
-        allowed_peer_mask=torch.tensor([[True, False], [True, False]]),
+        group_members=torch.tensor([[0, 1]], dtype=torch.int32),
+        group_member_mask=torch.tensor([[True, True]]),
         virtual_token_ids=torch.tensor([32000, 32000], dtype=torch.int32),
         virtual_window_sizes=torch.tensor([2, 2], dtype=torch.int32),
         token_ids=token_ids,
@@ -336,6 +336,53 @@ def test_flex_cross_batch_mask_can_use_position_scheduled_virtual_tokens():
     )
 
 
+def test_flex_cross_batch_physical_group_map_handles_shared_blocks():
+    metadata = make_flex_metadata_for_mask(
+        torch.tensor(
+            [
+                [10, 11, 99],
+                [20, 21, 99],
+                [30, 99, 32],
+                [40, 41, 42],
+            ],
+            dtype=torch.int32,
+        )
+    )
+    metadata.doc_ids = torch.tensor([0], dtype=torch.int32)
+    metadata.block_size = 1
+    metadata.query_start_loc = torch.tensor([0, 1, 1, 1, 1], dtype=torch.int32)
+    metadata.decode_offset = torch.tensor([2, 0, 0, 0], dtype=torch.int32)
+    metadata.seq_lens = torch.tensor([3, 3, 3, 3], dtype=torch.int32)
+    # Physical block 1 is visible in two different groups. The group lookup must
+    # use the query request's group row, not a single global physical-block owner.
+    metadata.physical_to_logical = torch.tensor(
+        [
+            [-1, -1, -1],
+            [-1, 2, -1],
+            [-1, 1, -1],
+            [-1, -1, -1],
+        ],
+        dtype=torch.long,
+    )
+    metadata.cross_batch_attention_metadata = CrossBatchAttentionMetadata(
+        enabled=torch.tensor([True, True, True, True]),
+        group_ids=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+        replica_ids=torch.tensor([0, 1, 0, 1], dtype=torch.int32),
+        group_members=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        group_member_mask=torch.tensor([[True, True], [True, True]]),
+        virtual_token_ids=torch.tensor([99, 99, 99, 99], dtype=torch.int32),
+        virtual_window_sizes=torch.tensor([2, 2, 2, 2], dtype=torch.int32),
+        token_ids=metadata.cross_batch_attention_metadata.token_ids,
+    )
+    metadata.group_physical_to_logical = None
+    metadata.group_physical_owner_batch = None
+    mask_mod = metadata.get_cross_batch_mask_mod()
+
+    assert mask_mod(
+        torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(1)
+    )
+
+
 def test_gpu_model_runner_builds_cross_batch_metadata_in_batch_order():
     runner = object.__new__(GPUModelRunner)
     runner.device = torch.device("cpu")
@@ -380,16 +427,8 @@ def test_gpu_model_runner_builds_cross_batch_metadata_in_batch_order():
     assert metadata is not None
     assert metadata.enabled.tolist() == [True, True, False]
     assert metadata.replica_ids.tolist() == [1, 0, -1]
-    assert metadata.allowed_peer_batches.tolist() == [
-        [1, -1, -1],
-        [0, -1, -1],
-        [-1, -1, -1],
-    ]
-    assert metadata.allowed_peer_mask.tolist() == [
-        [True, False, False],
-        [True, False, False],
-        [False, False, False],
-    ]
+    assert metadata.group_members.tolist() == [[0, 1]]
+    assert metadata.group_member_mask.tolist() == [[True, True]]
     assert metadata.token_ids.tolist() == [
         [10, 99, 11, 0],
         [20, 99, 21, 0],
@@ -474,8 +513,8 @@ def test_cross_batch_attention_changes_only_virtual_query_outputs():
         enabled=torch.tensor([True, True]),
         group_ids=torch.tensor([0, 0], dtype=torch.int32),
         replica_ids=torch.tensor([0, 1], dtype=torch.int32),
-        allowed_peer_batches=torch.tensor([[1, -1], [0, -1]], dtype=torch.int32),
-        allowed_peer_mask=torch.tensor([[True, False], [True, False]]),
+        group_members=torch.tensor([[0, 1]], dtype=torch.int32),
+        group_member_mask=torch.tensor([[True, True]]),
         virtual_token_ids=torch.tensor([99, 99], dtype=torch.int32),
         virtual_window_sizes=torch.tensor([4, 4], dtype=torch.int32),
         token_ids=token_ids,
@@ -521,8 +560,8 @@ def test_cross_batch_attention_rejects_non_flex_backend():
         enabled=torch.tensor([True]),
         group_ids=torch.tensor([0], dtype=torch.int32),
         replica_ids=torch.tensor([0], dtype=torch.int32),
-        allowed_peer_batches=torch.tensor([[-1]], dtype=torch.int32),
-        allowed_peer_mask=torch.tensor([[False]]),
+        group_members=torch.tensor([[0]], dtype=torch.int32),
+        group_member_mask=torch.tensor([[True]]),
         virtual_token_ids=torch.tensor([99], dtype=torch.int32),
         virtual_window_sizes=torch.tensor([4], dtype=torch.int32),
         token_ids=torch.tensor([[99]], dtype=torch.int32),
