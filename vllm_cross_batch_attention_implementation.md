@@ -276,9 +276,15 @@ The current code proves:
   setting `virtual_token_id=-1`; in that mode virtual positions are
   `virtual_window_size`, then every `virtual_window_size + 1` positions.
 - A real-checkpoint probe with a 128-token prompt, `virtual_window_size=127`,
-  four replicas, and first-token generation at the first virtual position
-  matched the HF reference top-1 token: both chose token id `220` (`" "`).
-  HF logprob was `-0.014691`; vLLM logprob was `-0.042636`.
+  four replicas, and first-token generation at the first virtual position now
+  closely matches the HF reference after fixing the parent repo's custom Qwen3
+  RoPE helper to read `config.rope_parameters["rope_theta"]`. The earlier HF
+  reference used `config.rope_theta == 10000.0`, while stock Qwen3/vLLM use
+  `rope_parameters["rope_theta"] == 1000000`.
+  - HF top-1: token id `220` (`" "`), logprob `-0.039079`
+  - vLLM top-1: token id `220` (`" "`), logprob `-0.039708`
+  - Most overlapping top-token logprobs differ by about `0.00063`; the largest
+    common top-token drift in the 20-token probe was about `0.06313`.
 - The same trained adapter generated coherent arithmetic text in vLLM on
   `Problem: What is 7 + 15?\nSolution:`:
   `7 + 15 = 22\nSolution 2\n...`.
@@ -286,17 +292,19 @@ The current code proves:
   `examples/offline_inference/cross_batch_trained_adapter_probe.py`.
   The HF mode should be run with the parent repo `.venv`; the vLLM mode should
   be run with the vLLM fork `.venv`; compare mode summarizes the JSON outputs.
-- Follow-up isolation showed HF standard `Qwen3ForCausalLM + PEFT` is much
-  closer to vLLM than the custom HF batch-parscale class on the same 128-token
-  prompt. Standard HF vs vLLM had top-1 logprob drift around `0.005`; the
-  larger tail drift appears tied to the custom grouped cross-batch path or to
-  the identical-replica probe, not plain vLLM LoRA loading.
+- Follow-up isolation showed the original larger drift was in the parent repo's
+  custom HF reference, not in vLLM. With cross-batch disabled, the custom
+  `Qwen3BatchParScaleForCausalLM` path already diverged from stock
+  `Qwen3ForCausalLM + PEFT`. The root cause was stale RoPE config handling in
+  `src/shared.py`: it read `config.rope_theta` instead of Qwen3's active
+  `config.rope_parameters["rope_theta"]`. After that fix, the trained adapter
+  HF reference and vLLM first-virtual-position probe agree tightly.
 
 The current code still does not prove:
 
-- tight HF-reference numerical agreement for the full distribution on the
-  trained adapter. The first virtual-position probe matched top-1, but lower
-  ranked common top tokens still differed by roughly `0.46` to `2.78` logprob.
+- tight HF-reference numerical agreement across multi-token decode continuation
+  for the trained adapter. The first virtual-position probe now matches closely,
+  but continuation through later virtual positions still needs coverage.
 - grouped scheduling is correct under every preemption, priority, async, and
   connector interaction
 
@@ -318,19 +326,19 @@ The current code still does not prove:
   specialization problems and the first FlexAttention peer-topology shape
   problem, but leaves performance work unresolved.
 - The HF-side `modeling_qwen3_batch_parscale.py` comparison is still ad hoc.
-  It now covers the trained non-dynamic adapter at the first virtual position,
-  but does not cover decode continuation across several virtual positions,
-  padding, prefix cache, or more than one group.
+  It now covers the trained non-dynamic adapter at the first virtual position
+  with close numerical agreement after the RoPE fix, but does not cover decode
+  continuation across several virtual positions, padding, prefix cache, or more
+  than one group.
 
 ## Next Steps
 
 1. Broaden scheduler tests around priority scheduling, preemption,
    async scheduling, mixed grouped/ungrouped traffic, prefix-cache hits, and
    connector paths.
-2. Investigate the remaining lower-ranked logprob drift in the trained-adapter
-   probe. The first suspects are the custom HF grouped mask semantics, whether
-   the identical-replica first-virtual-position probe is sensitive enough, and
-   residual attention-mask differences at the first virtual position.
+2. Extend the trained-adapter numerical probe beyond the first virtual position
+   so it covers decode continuation, mixed replica prompts, padding, prefix
+   cache settings, and multiple groups.
 3. Convert the conservative KV-capacity preflight into a true transactional
    grouped allocation or rollback mechanism if broader scheduler tests expose a
    remaining split-group path.
