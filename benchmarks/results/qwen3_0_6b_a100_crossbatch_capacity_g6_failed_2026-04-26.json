@@ -1,0 +1,34 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "device": "NVIDIA A100-SXM4-80GB",
+  "torch": "2.10.0+cu128",
+  "cuda": "12.8",
+  "max_num_seqs": 24,
+  "attention_backend": "FLEX_ATTENTION",
+  "enforce_eager": true,
+  "enable_prefix_caching": false,
+  "cases": [
+    {
+      "mode": "baseline",
+      "groups": 6,
+      "group_size": 4,
+      "num_reqs": 24,
+      "prompt_len": 128,
+      "max_tokens": 64,
+      "virtual_window_size": 127,
+      "trials": [
+        {
+          "elapsed_s": 0.9443877649973729,
+          "output_tokens": 1536,
+          "prompt_tokens": 3072,
+          "output_tok_s": 1626.4505502189272,
+          "total_tok_s": 4879.351650656781
+        }
+      ],
+      "output_tok_s_mean": 1626.4505502189272,
+      "output_tok_s_stdev": 0.0,
+      "total_tok_s_mean": 4879.351650656781,
+      "total_tok_s_stdev": 0.0
+    }
+  ]
+}

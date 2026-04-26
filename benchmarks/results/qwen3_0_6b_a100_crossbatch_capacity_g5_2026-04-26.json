@@ -1,0 +1,56 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "device": "NVIDIA A100-SXM4-80GB",
+  "torch": "2.10.0+cu128",
+  "cuda": "12.8",
+  "max_num_seqs": 20,
+  "attention_backend": "FLEX_ATTENTION",
+  "enforce_eager": true,
+  "enable_prefix_caching": false,
+  "cases": [
+    {
+      "mode": "baseline",
+      "groups": 5,
+      "group_size": 4,
+      "num_reqs": 20,
+      "prompt_len": 128,
+      "max_tokens": 64,
+      "virtual_window_size": 127,
+      "trials": [
+        {
+          "elapsed_s": 0.9131456690010964,
+          "output_tokens": 1280,
+          "prompt_tokens": 2560,
+          "output_tok_s": 1401.7478738087987,
+          "total_tok_s": 4205.243621426396
+        }
+      ],
+      "output_tok_s_mean": 1401.7478738087987,
+      "output_tok_s_stdev": 0.0,
+      "total_tok_s_mean": 4205.243621426396,
+      "total_tok_s_stdev": 0.0
+    },
+    {
+      "mode": "cross",
+      "groups": 5,
+      "group_size": 4,
+      "num_reqs": 20,
+      "prompt_len": 128,
+      "max_tokens": 64,
+      "virtual_window_size": 127,
+      "trials": [
+        {
+          "elapsed_s": 8.514499344997603,
+          "output_tokens": 1280,
+          "prompt_tokens": 2560,
+          "output_tok_s": 150.33179851637658,
+          "total_tok_s": 450.99539554912974
+        }
+      ],
+      "output_tok_s_mean": 150.33179851637658,
+      "output_tok_s_stdev": 0.0,
+      "total_tok_s_mean": 450.99539554912974,
+      "total_tok_s_stdev": 0.0
+    }
+  ]
+}
