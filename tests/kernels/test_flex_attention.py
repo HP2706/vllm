@@ -14,9 +14,11 @@ from tests.v1.attention.utils import (
     create_vllm_config,
 )
 from vllm.v1.attention.backends.flex_attention import (
+    FlexAttentionMetadata,
     FlexAttentionMetadataBuilder,
     physical_to_logical_mapping,
 )
+from vllm.v1.cross_batch_attention import CrossBatchAttentionMetadata
 
 from ..models.utils import check_embeddings_close, check_logprobs_close
 
@@ -193,6 +195,132 @@ def test_block_mask_direct_vs_slow_path():
 
     assert all_contained, (
         "Direct path is missing blocks required by slow path:\n"
+        + "\n".join(missing_details)
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or TORCH_VERSION < DIRECT_BUILD_VERSION,
+    reason="CUDA not available or PyTorch version < 2.9",
+)
+def test_cross_batch_block_mask_direct_vs_slow_path():
+    """Test that direct path includes slow-path cross-batch peer blocks."""
+    device = torch.device("cuda")
+    block_size = 4
+    seq_lens = torch.tensor([8, 8, 8, 8, 8], dtype=torch.int32, device=device)
+    query_lens = torch.tensor([2, 1, 3, 2, 1], dtype=torch.int32, device=device)
+    query_start_loc = torch.zeros(len(query_lens) + 1, dtype=torch.int32, device=device)
+    query_start_loc[1:] = query_lens.cumsum(0)
+    num_actual_tokens = int(query_lens.sum().item())
+
+    # Request rows are deliberately not grouped contiguously:
+    #   group 0: requests 0 and 2
+    #   group 1: requests 1 and 3
+    #   request 4: ungrouped traffic
+    block_table = torch.tensor(
+        [
+            [1, 2],
+            [3, 4],
+            [5, 6],
+            [7, 8],
+            [9, 10],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    total_blocks = 16
+    token_ids = torch.tensor(
+        [
+            [11, 12, 99, 14, 15, 16, 99, 18],
+            [21, 22, 99, 24, 25, 26, 99, 28],
+            [31, 32, 99, 34, 35, 36, 99, 38],
+            [41, 42, 99, 44, 45, 46, 99, 48],
+            [51, 52, 99, 54, 55, 56, 99, 58],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    cross_batch = CrossBatchAttentionMetadata(
+        enabled=torch.tensor([True, True, True, True, False], device=device),
+        group_ids=torch.tensor([0, 1, 0, 1, -1], dtype=torch.int32, device=device),
+        replica_ids=torch.tensor([0, 0, 1, 1, -1], dtype=torch.int32, device=device),
+        allowed_peer_batches=torch.tensor(
+            [[2, -1], [3, -1], [0, -1], [1, -1], [-1, -1]],
+            dtype=torch.int32,
+            device=device,
+        ),
+        allowed_peer_mask=torch.tensor(
+            [
+                [True, False],
+                [True, False],
+                [True, False],
+                [True, False],
+                [False, False],
+            ],
+            device=device,
+        ),
+        virtual_token_ids=torch.tensor(
+            [99, 99, 99, 99, 99], dtype=torch.int32, device=device
+        ),
+        virtual_window_sizes=torch.tensor(
+            [4, 4, 4, 4, 4], dtype=torch.int32, device=device
+        ),
+        token_ids=token_ids,
+    )
+
+    common_kwargs = dict(
+        causal=True,
+        num_actual_tokens=num_actual_tokens,
+        max_query_len=int(query_lens.max().item()),
+        query_start_loc=query_start_loc,
+        max_seq_len=int(seq_lens.max().item()),
+        seq_lens=seq_lens,
+        block_table=block_table,
+        slot_mapping=torch.arange(num_actual_tokens, dtype=torch.int64, device=device),
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+        total_cache_tokens=total_blocks * block_size,
+        block_size=block_size,
+        max_possible_sequence_length=int(seq_lens.max().item()),
+        num_reqs=len(seq_lens),
+        physical_to_logical=physical_to_logical_mapping(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            block_size=block_size,
+            total_blocks=total_blocks,
+        ),
+        decode_offset=seq_lens - query_lens,
+        num_blocks_per_seq=((seq_lens + block_size - 1) // block_size).to(torch.int32),
+        q_block_size=16,
+        kv_block_size=block_size,
+        cross_batch_attention_metadata=cross_batch,
+    )
+    metadata_direct = FlexAttentionMetadata(direct_build=True, **common_kwargs)
+    metadata_slow = FlexAttentionMetadata(direct_build=False, **common_kwargs)
+
+    assert metadata_direct.block_mask is not None
+    assert metadata_slow.block_mask is not None
+
+    direct_indices = metadata_direct.block_mask.kv_indices[0, 0]
+    slow_indices = metadata_slow.block_mask.kv_indices[0, 0]
+    direct_num = metadata_direct.block_mask.kv_num_blocks[0, 0]
+    slow_num = metadata_slow.block_mask.kv_num_blocks[0, 0]
+
+    missing_details = []
+    for group_idx in range(direct_num.shape[0]):
+        direct_blocks = set(direct_indices[group_idx, : direct_num[group_idx]].tolist())
+        slow_blocks = set(slow_indices[group_idx, : slow_num[group_idx]].tolist())
+        missing_blocks = slow_blocks - direct_blocks
+        if missing_blocks:
+            missing_details.append(
+                f"Group {group_idx}: missing {sorted(missing_blocks)}"
+            )
+
+    assert not missing_details, (
+        "Direct path is missing cross-batch blocks required by slow path:\n"
         + "\n".join(missing_details)
     )
 

@@ -1005,6 +1005,13 @@ class Scheduler(SchedulerInterface):
         if estimated_tokens > token_budget:
             return False
 
+        num_new_tokens_by_req = {
+            req: self._estimate_num_new_tokens_for_running_request(req, token_budget)
+            for req in group
+        }
+        if not self._cross_batch_group_has_kv_capacity(num_new_tokens_by_req):
+            return False
+
         group = sorted(group, key=lambda req: req.cross_batch_attention.replica_id)
         group_set = set(group)
         remainder = [req for req in self.running if req not in group_set]
@@ -1055,6 +1062,7 @@ class Scheduler(SchedulerInterface):
             return False
 
         estimated_tokens = 0
+        num_new_tokens_by_req: dict[Request, int] = {}
         threshold = self.scheduler_config.long_prefill_token_threshold
         for group_req in group:
             if self._is_blocked_waiting_status(group_req.status):
@@ -1065,9 +1073,13 @@ class Scheduler(SchedulerInterface):
             if not self.scheduler_config.enable_chunked_prefill:
                 if num_new_tokens > token_budget:
                     return False
-            estimated_tokens += min(num_new_tokens, token_budget)
+            num_new_tokens = min(num_new_tokens, token_budget)
+            estimated_tokens += num_new_tokens
+            num_new_tokens_by_req[group_req] = num_new_tokens
 
         if estimated_tokens > token_budget:
+            return False
+        if not self._cross_batch_group_has_kv_capacity(num_new_tokens_by_req):
             return False
 
         self.waiting.remove_requests(group)
@@ -1081,6 +1093,46 @@ class Scheduler(SchedulerInterface):
         ):
             self.waiting.prepend_request(group_req)
         return True
+
+    def _cross_batch_group_has_kv_capacity(
+        self, num_new_tokens_by_req: dict[Request, int]
+    ) -> bool:
+        """Conservatively check whether a cross-batch group can fit in KV cache."""
+        kv_cache_manager = getattr(self, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            return True
+
+        coordinator = getattr(kv_cache_manager, "coordinator", None)
+        block_pool = getattr(kv_cache_manager, "block_pool", None)
+        empty_blocks = getattr(kv_cache_manager, "empty_kv_cache_blocks", None)
+        if coordinator is None or block_pool is None or empty_blocks is None:
+            return True
+
+        num_required_blocks = 0
+        max_model_len = getattr(self, "max_model_len", None)
+        if max_model_len is None:
+            max_model_len = kv_cache_manager.max_model_len
+        num_lookahead_tokens = getattr(self, "num_lookahead_tokens", 0)
+        empty_block_list = empty_blocks.blocks
+        for request, num_new_tokens in num_new_tokens_by_req.items():
+            if num_new_tokens <= 0:
+                continue
+            num_tokens_main_model = min(
+                request.num_computed_tokens + num_new_tokens, max_model_len
+            )
+            num_tokens_need_slot = min(
+                num_tokens_main_model + num_lookahead_tokens, max_model_len
+            )
+            num_required_blocks += coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+                new_computed_blocks=empty_block_list,
+                num_encoder_tokens=0,
+                total_computed_tokens=request.num_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+            )
+
+        return num_required_blocks <= block_pool.get_num_free_blocks()
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

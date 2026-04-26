@@ -29,9 +29,15 @@ Implementation commit: `f32aa74b7` (`Add V1 cross-batch FlexAttention prototype`
 - FlexAttention now supports a cross-batch decoder mask:
   - same-request causal attention remains allowed
   - peer attention is allowed only for same-group virtual tokens
-  - peer virtual attention is causal in virtual index
+  - peer virtual attention is causal in absolute logical position, matching
+    `modeling_qwen3_batch_parscale.py`
 - FlexAttention direct block-mask construction includes peer KV blocks for
   enabled same-group peers, then relies on the mask for exact token filtering.
+- Cross-batch metadata now fails loudly if attention metadata is built for a
+  non-FlexAttention backend.
+- The scheduler now performs a conservative KV-capacity preflight before
+  preparing a complete cross-batch group, so a group that cannot fit is skipped
+  before any replica is admitted.
 - Cross-batch batches force eager execution by overriding the batch descriptor to
   `CUDAGraphMode.NONE`.
 
@@ -50,7 +56,7 @@ Passing tests:
 python -m pytest tests/v1/test_cross_batch_attention.py -q
 ```
 
-Result: `7 passed`
+Result after latest changes: `11 passed`
 
 ```bash
 python -m pytest tests/kernels/test_flex_attention.py -q \
@@ -58,6 +64,23 @@ python -m pytest tests/kernels/test_flex_attention.py -q \
 ```
 
 Result: `1 passed, 3 deselected`
+
+```bash
+python -m pytest tests/v1/test_cross_batch_attention.py \
+  tests/kernels/test_flex_attention.py -q \
+  -k "cross_batch or physical_to_logical_mapping_handles_reused_blocks"
+```
+
+Result after latest changes: `14 passed, 3 deselected`
+
+This includes:
+
+- synthetic cross-batch direct-vs-slow FlexAttention block-mask coverage
+- dense reference attention-output coverage showing non-virtual query outputs
+  match baseline while virtual query outputs change with peer virtual context
+- regression coverage for absolute-position virtual causality
+- rejection coverage for non-FlexAttention backends
+- scheduler KV-capacity preflight coverage for grouped admission
 
 ```bash
 git diff --check
@@ -72,6 +95,7 @@ python -m py_compile \
   vllm/v1/worker/gpu/model_states/default.py \
   vllm/v1/attention/backend.py \
   vllm/v1/attention/backends/flex_attention.py \
+  tests/kernels/test_flex_attention.py \
   tests/v1/test_cross_batch_attention.py
 ```
 
@@ -147,8 +171,10 @@ Result:
   - request `1`: `' step by'`, token ids `[3019, 553]`
 - The script printed `qwen3 cross-batch flex smoke ok`.
 - vLLM logged `Engine core proc EngineCore died unexpectedly, shutting down
-  client` during teardown after successful generation. This should be
-  investigated, but it did not prevent the smoke test from completing.
+  client` during teardown after successful generation. A baseline Qwen3-0.6B
+  FlexAttention run without cross-batch metadata also reproduces the same
+  teardown log after successful generation, so this appears unrelated to the
+  cross-batch implementation.
 
 Earlier Qwen run without `VLLM_NO_USAGE_STATS=1` also generated successfully,
 but a background usage-stat thread hit `PermissionError` writing
@@ -159,37 +185,44 @@ config home.
 
 This is a working prototype slice, not production-ready.
 
-Approximate state: about 60% of the first milestone.
+Approximate state: about 75% of the first milestone.
 
 The current code proves:
 
 - request metadata can enter through `SamplingParams.extra_args`
 - V1 scheduler/worker/FlexAttention plumbing works for simple grouped requests
 - FlexAttention mask semantics work for scalar and vectorized synthetic cases
+- Cross-batch direct block-mask construction is a superset of slow-path block
+  construction for synthetic grouped batches
+- Cross-batch peer attention changes virtual-query attention outputs while
+  leaving non-virtual query outputs identical in a dense reference test
+- The Qwen3 batch-parscale absolute-position virtual causality rule is now
+  reflected in the vLLM mask
+- Group admission has a conservative KV-capacity preflight before moving a
+  complete group to the scheduling front
+- Cross-batch metadata is rejected for non-FlexAttention backends instead of
+  silently being ignored
 - Qwen3-0.6B can run a grouped cross-batch FlexAttention smoke generation
 
 The current code does not yet prove:
 
 - logits are numerically correct against a reference implementation
-- cross-batch peer attention changes exactly the intended virtual-token logits
-- direct block-mask construction is equivalent to slow path for cross-batch
-  cases
-- group scheduling is fully transactional under KV allocation failure
+- full end-to-end model logits match the HF-side Qwen3 batch-parscale
+  implementation
+- grouped scheduling is correct under every preemption, priority, async, and
+  connector interaction
 
 ## Known Gaps
 
-- Scheduling is conservative but not fully atomic. If KV allocation fails after
-  some replicas in a group are scheduled, the current implementation can still
-  split the group. This needs transactional allocation or rollback.
+- Scheduling now has a conservative KV-capacity preflight for grouped admission,
+  but it is still not a true transactional allocation/rollback layer. Prefix
+  cache, encoder, connector, and preemption interactions need broader tests.
 - Running-group scheduling keeps live replicas together when they all fit, but
   more tests are needed for preemption, priority scheduling, async scheduling,
   and mixed grouped/ungrouped traffic.
-- Virtual-position semantics currently use `logical_position %
-  virtual_window_size`. This is only an approximation of the training-side
-  semantics and may need a model-specific absolute virtual-position rule.
 - The request API is an `extra_args` research hook, not a polished public API.
 - Only the V1 FlexAttention backend is implemented. Other attention backends
-  ignore the metadata.
+  reject cross-batch metadata.
 - DBO/microbatching, DCP/DP, speculative decoding, CUDA graphs, prefix-cache
   sharing edge cases, sliding-window interactions, encoder-decoder models, and
   LoRA interaction are not validated.
@@ -200,13 +233,13 @@ The current code does not yet prove:
 
 ## Next Steps
 
-1. Add a synthetic FlexAttention direct-vs-slow block-mask test for cross-batch
-   metadata that avoids gated Hugging Face models.
-2. Add a tiny-model logits test that demonstrates disabled metadata matches
-   baseline and enabled metadata changes only virtual-token grouped paths.
-3. Make scheduler group admission transactional around KV allocation.
-4. Replace modulo virtual indexing with the exact absolute virtual-position rule
-   required by the Qwen3 batch-parscale model.
-5. Add a Qwen3-specific integration test once the exact virtual-token convention
-   and expected logits/reference behavior are defined.
-
+1. Add a full Qwen3-specific logits/reference comparison against the HF-side
+   `modeling_qwen3_batch_parscale.py` implementation.
+2. Broaden scheduler tests around priority scheduling, preemption,
+   async scheduling, mixed grouped/ungrouped traffic, prefix-cache hits, and
+   connector paths.
+3. Convert the conservative KV-capacity preflight into a true transactional
+   grouped allocation or rollback mechanism if broader scheduler tests expose a
+   remaining split-group path.
+4. Investigate the baseline FlexAttention Qwen3 engine-core teardown log if it
+   matters for the surrounding benchmark harness.

@@ -470,14 +470,11 @@ class FlexAttentionMetadata:
                 cross_batch.token_ids[safe_peer_batches, safe_peer_kv_idx]
                 == virtual_token_id
             )
-            virtual_window_size = cross_batch.virtual_window_sizes[q_req]
-            q_virtual_idx = logical_q_idx % virtual_window_size
-            peer_virtual_idx = peer_logical_kv_idx % virtual_window_size
             peer_allowed = (
                 peer_valid
                 & q_is_virtual.unsqueeze(-1)
                 & peer_kv_is_virtual
-                & (q_virtual_idx.unsqueeze(-1) >= peer_virtual_idx)
+                & (logical_q_idx.unsqueeze(-1) >= peer_logical_kv_idx)
             )
 
             return same_allowed | peer_allowed.any(dim=-1)

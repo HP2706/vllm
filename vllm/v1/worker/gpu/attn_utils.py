@@ -189,6 +189,15 @@ def build_attn_metadata(
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
 
+    if cross_batch_attention_metadata is not None:
+        for group_list in attn_groups:
+            for attn_group in group_list:
+                if attn_group.backend.get_name() != "FLEX_ATTENTION":
+                    raise ValueError(
+                        "cross_batch_attention requires the FLEX_ATTENTION "
+                        f"backend, but got {attn_group.backend.get_name()}"
+                    )
+
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
