@@ -56,6 +56,161 @@ Environment:
 - `torch==2.10.0`
 - GPU: `NVIDIA A100-SXM4-80GB`
 
+Environment repair note, 2026-04-29:
+
+The submodule is checked out detached, so `VLLM_USE_PRECOMPILED=1` can fall
+back to the `nightly` precompiled wheel unless the precompiled wheel commit is
+set explicitly. That produced a native extension ABI mismatch with
+`torch==2.10.0`. Fix the install by pinning the wheel to the merge-base between
+this fork and upstream `main`:
+
+```bash
+git -C vllm fetch https://github.com/vllm-project/vllm main
+git -C vllm merge-base FETCH_HEAD HEAD
+```
+
+Current merge-base:
+
+```text
+4508532fbd299cff81ecb6f1ccea2e2d0f56d329
+```
+
+Install command used from the repository root:
+
+```bash
+VLLM_USE_PRECOMPILED=1 \
+VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 \
+VLLM_PRECOMPILED_WHEEL_COMMIT=4508532fbd299cff81ecb6f1ccea2e2d0f56d329 \
+.venv/bin/python -m pip install -e ./vllm \
+  --no-deps --force-reinstall --no-build-isolation
+```
+
+Keep the environment on:
+
+- `torch==2.10.0`
+- `torchvision==0.25.0`
+- `torchaudio==2.10.0`
+- `numpy==1.26.4`
+- `openai==2.24.0`
+
+`numpy==1.26.4` is intentional for this text-generation path because the wider
+HF/SciPy stack imports cleanly with it. The top-level project uses a uv
+dependency override to keep `opencv-python-headless<4.13`; `pip check` will
+still report that this violates vLLM's declared `opencv-python-headless>=4.13`
+requirement. That OpenCV path is not used by this text-generation verification.
+Run vLLM commands with:
+
+```bash
+VLLM_PLUGINS=lora_filesystem_resolver,lora_hf_hub_resolver
+```
+
+This avoids loading the unrelated TorchRL vLLM plugin override, which otherwise
+registers an import path that is not available in this environment.
+
+Smoke check after repair:
+
+```bash
+cd /tmp
+VLLM_PLUGINS=lora_filesystem_resolver,lora_hf_hub_resolver \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+VLLM_NO_USAGE_STATS=1 \
+/home/ubuntu/parallel_reasoning/.venv/bin/python - <<'PY'
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="Qwen/Qwen3-0.6B",
+    dtype="bfloat16",
+    max_model_len=64,
+    gpu_memory_utilization=0.35,
+    enforce_eager=True,
+    disable_log_stats=True,
+)
+outputs = llm.generate(
+    ["The capital of France is"],
+    SamplingParams(temperature=0.0, max_tokens=8),
+    use_tqdm=False,
+)
+print(repr(outputs[0].outputs[0].text))
+PY
+```
+
+Result: `' Paris. The capital of Italy is Rome'`
+
+Adapter verification, 2026-04-29:
+
+- Adapter:
+  `hanspeterlyngsoeraaschoujensen/qwen3_finetune_nb4_nr0.5_nv4_20260426_155536`,
+  subfolder `final`.
+- Base model: `Qwen/Qwen3-0.6B`.
+- HF reference loaded the adapter through
+  `src.modeling_qwen3_batch_parscale.Qwen3BatchParScaleForCausalLM` and used
+  only a naive autoregressive `forward(...)` loop, not
+  `transformers.generate(...)`.
+- The PEFT-wrapped HF model must be moved to `bfloat16` after loading the
+  adapter:
+
+```python
+model = PeftModel.from_pretrained(model, repo, subfolder="final", token=True)
+model.eval().to(device="cuda", dtype=torch.bfloat16)
+```
+
+  Without this, FlexAttention sees mixed fp32/bf16 QKV tensors.
+- HF forward-loop result for
+  `Question: What is 17 + 25?\nAnswer:` with 4 copies and 32 new tokens:
+  ` 42\n\nSolution: 17 + 25 = 42\n\nSolution: 17 + 25 = 42\n\n` for all
+  copies. Throughput was 128 generated tokens in 14.01s, about 9.14 tok/s.
+- vLLM loaded the same adapter with `enable_lora=True`, `max_lora_rank=16`,
+  `attention_config={"backend": "FLEX_ATTENTION"}`, and cross-batch
+  `SamplingParams.extra_args`. The 32-token vLLM output matched the HF
+  forward-loop text exactly for all four copies. Throughput was 128 generated
+  tokens in 8.432s, about 15.18 tok/s.
+- A longer vLLM sample with 4 copies and 192 tokens each produced 768 generated
+  tokens in 16.411s, about 46.8 tok/s. Text was coherent math-format output,
+  but sampled quality was variable at `temperature=0.7`: two copies reached the
+  correct `$31` answer, while other sampled copies made arithmetic or setup
+  mistakes.
+- Explicit adapter logprob/mask check:
+  - HF source was the local
+    `src/modeling_qwen3_batch_parscale.py::Qwen3BatchParScaleForCausalLM`
+    loaded through PEFT, with `attn_implementation="flex_attention"`,
+    `cross_batch_attend=True`, `n_batches=4`, and direct `forward(...)` calls.
+  - Prompts were raw token-id prompts:
+    `Question: red\nAnswer:`, `Question: blue\nAnswer:`,
+    `Question: green\nAnswer:`, and `Question: yellow\nAnswer:`.
+  - Prompt length was 7 tokens. `virtual_window_size=6` made the final prompt
+    token virtual in the HF position-based mask. vLLM used
+    `virtual_token_id=-1` and `virtual_window_size=6`, which takes the same
+    position-based virtual-token path in the fork.
+  - HF cross-batch enabled versus
+    `disable_batch_attention=True` changed next-token logprobs with
+    `max_abs_logprob_delta=2.882659912109375` and
+    `mean_abs_logprob_delta=0.3999544382095337`, so the HF mask is not a no-op.
+  - vLLM next-token logprobs with LoRA and cross-batch metadata were compared
+    against the HF cross-batch logprobs for the HF top-10 tokens on each of the
+    4 replicas. All 40 tokens were present in vLLM's top-20 logprobs, with
+    `max_abs_delta=0.07363343238830566` and
+    `mean_abs_delta=0.02482966482639313`.
+  - Baseline no-cross comparisons on the same prompts show this is not merely
+    generic vLLM/HF agreement:
+    - HF cross versus HF no-cross over the full vocabulary:
+      `max_abs_delta=2.882659912109375`,
+      `mean_abs_delta=0.3999544382095337`.
+    - HF no-cross versus HF cross on HF-cross top-10 tokens:
+      `max_abs_delta=0.819669246673584`,
+      `mean_abs_delta=0.20648053139448166`.
+    - vLLM cross versus HF cross on HF-cross top-10 tokens:
+      `max_abs_delta=0.07363343238830566`,
+      `mean_abs_delta=0.02482966482639313`.
+    - vLLM no-cross versus HF no-cross on HF-no-cross top-10 tokens:
+      `max_abs_delta=0.08745193481445312`,
+      `mean_abs_delta=0.03298337757587433`.
+    - vLLM no-cross versus HF cross on HF-cross top-10 tokens:
+      `max_abs_delta=0.8427460193634033`,
+      `mean_abs_delta=0.20561323910951615`.
+    - vLLM cross versus HF no-cross on HF-no-cross top-10 tokens:
+      `max_abs_delta=0.8376636505126953`,
+      `mean_abs_delta=0.25198634415864946`.
+
 Passing tests:
 
 ```bash
