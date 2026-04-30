@@ -242,7 +242,7 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_NO_USAGE_STATS=1 \
 Result: `1 passed`
 
 This loads `Qwen/Qwen3-0.6B` through both the HF-side
-`src/modeling_qwen3_batch_parscale.py` reference and vLLM FlexAttention, then
+`src/models/pytorch/modeling_qwen3_batch_parscale.py` reference and vLLM FlexAttention, then
 asserts first-token selected logprobs are within `0.15` absolute tolerance and
 that the HF top-5 token set is present in vLLM's returned top logprobs.
 
@@ -327,7 +327,7 @@ Cross-batch top logprobs:
 This proves the active vLLM path is no longer silently falling back to baseline
 attention. The values are close to the earlier HF FlexAttention reference probe,
 but there is still no committed end-to-end numerical assertion against
-`src/modeling_qwen3_batch_parscale.py`.
+`src/models/pytorch/modeling_qwen3_batch_parscale.py`.
 
 ## Qwen3-0.6B Smoke Test
 

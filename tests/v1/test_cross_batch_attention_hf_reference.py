@@ -30,12 +30,12 @@ def _repo_root() -> Path:
 
 def _load_hf_reference_model():
     root = _repo_root()
-    if not (root / "src/modeling_qwen3_batch_parscale.py").exists():
+    if not (root / "src/models/pytorch/modeling_qwen3_batch_parscale.py").exists():
         pytest.skip("HF batch-parscale reference source is not available")
     sys.path.insert(0, str(root))
     pytest.importorskip("accelerate")
 
-    from src.modeling_qwen3_batch_parscale import Qwen3BatchParScaleForCausalLM
+    from src.models.pytorch.modeling_qwen3_batch_parscale import Qwen3BatchParScaleForCausalLM
 
     model, _ = Qwen3BatchParScaleForCausalLM.from_qwen_model(
         MODEL,

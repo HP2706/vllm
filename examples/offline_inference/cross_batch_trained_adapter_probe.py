@@ -49,7 +49,7 @@ def run_hf(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
     sys.path.insert(0, args.parent_repo)
-    from src.modeling_qwen3_batch_parscale import Qwen3BatchParScaleForCausalLM
+    from src.models.pytorch.modeling_qwen3_batch_parscale import Qwen3BatchParScaleForCausalLM
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     tokenizer.add_special_tokens({"mask_token": "[MASK]"})
