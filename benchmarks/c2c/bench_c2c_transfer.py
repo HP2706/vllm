@@ -80,7 +80,7 @@ def _wait_ready(port: int, timeout_s: float = 600.0) -> None:
 
 
 def _completion(
-    port: int, prompt: str, max_tokens: int, model: str
+    port: int, prompt: str | list[int], max_tokens: int, model: str
 ) -> tuple[float, str]:
     t0 = time.perf_counter()
     r = requests.post(
@@ -98,12 +98,11 @@ def _completion(
     return dt * 1000.0, r.json()["choices"][0]["text"]
 
 
-def _build_prompt(tokenizer: Any, target_tokens: int) -> str:
+def _build_prompt_ids(tokenizer: Any, target_tokens: int) -> list[int]:
     text = ""
     while len(tokenizer(text)["input_ids"]) < target_tokens:
         text += BASE_SENTENCE
-    ids = tokenizer(text)["input_ids"][:target_tokens]
-    return tokenizer.decode(ids)
+    return list(tokenizer(text)["input_ids"][:target_tokens])
 
 
 def run(
@@ -139,20 +138,21 @@ def run(
     tok = AutoTokenizer.from_pretrained(CONSUMER_MODEL)
     results: list[dict[str, Any]] = []
     for n in prompt_lengths:
-        prompt = _build_prompt(tok, n)
-        n_actual = len(tok(prompt)["input_ids"])
+        prompt_ids = _build_prompt_ids(tok, n)
+        prompt_text = tok.decode(prompt_ids)
+        n_actual = len(prompt_ids)
 
         # 1) consumer prefill WITHOUT transfer (no manifest exists yet)
-        consumer_solo_ms, _ = _completion(CONSUMER_PORT, prompt, 1, CONSUMER_MODEL)
+        consumer_solo_ms, _ = _completion(CONSUMER_PORT, prompt_ids, 1, CONSUMER_MODEL)
 
         # 2) producer prefill (stages KV + publishes IPC handle)
-        producer_ms, _ = _completion(PRODUCER_PORT, prompt, 1, PRODUCER_MODEL)
+        producer_ms, _ = _completion(PRODUCER_PORT, prompt_ids, 1, PRODUCER_MODEL)
         time.sleep(0.5)
 
-        # 3) consumer prefill WITH transfer (same prompt text, new request).
+        # 3) consumer prefill WITH transfer (same receiver token ids, new request).
         # prefix caching is off, so the consumer recomputes prefill while the
         # connector pulls the producer KV inside the same forward.
-        consumer_xfer_ms, _ = _completion(CONSUMER_PORT, prompt, 1, CONSUMER_MODEL)
+        consumer_xfer_ms, _ = _completion(CONSUMER_PORT, prompt_ids, 1, CONSUMER_MODEL)
 
         # in-connector timing
         key_timings: list[dict[str, Any]] = []
@@ -165,9 +165,11 @@ def run(
 
         # 4) text handoff baseline: producer writes a summary, consumer
         # prefills prompt + summary
-        handoff_gen_ms, summary = _completion(PRODUCER_PORT, prompt, 64, PRODUCER_MODEL)
+        handoff_gen_ms, summary = _completion(
+            PRODUCER_PORT, prompt_text, 64, PRODUCER_MODEL
+        )
         handoff_prefill_ms, _ = _completion(
-            CONSUMER_PORT, prompt + "\n" + summary, 1, CONSUMER_MODEL
+            CONSUMER_PORT, prompt_text + "\n" + summary, 1, CONSUMER_MODEL
         )
 
         row = {
