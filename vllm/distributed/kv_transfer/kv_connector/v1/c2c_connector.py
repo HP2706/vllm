@@ -282,6 +282,16 @@ class C2CConnector(KVConnectorBase_V1):
                     "producer_extract_ms": manifest["extract_ms"],
                     "fusion_ms": None,
                 }
+                if self._checkpoints_dir is None:
+                    out_path = os.path.join(self._dir, f"timing_{req.key}.json")
+                    with open(out_path, "w") as f:
+                        json.dump(self._timings[req.key], f, indent=2)
+                logger.info(
+                    "C2C consumer: transferred %.2f MB for key=%s in %.3f ms",
+                    nbytes / 1e6,
+                    req.key,
+                    copy_ms,
+                )
             # Queue fusion for this request (runs in wait_for_save, once the
             # receiver's own prompt KV for this step exists in the paged cache).
             if self._checkpoints_dir is not None and req.key in self._staged:
