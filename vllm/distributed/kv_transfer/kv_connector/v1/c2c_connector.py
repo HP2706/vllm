@@ -120,9 +120,27 @@ class C2CConnector(KVConnectorBase_V1):
         self._checkpoints_dir: str | None = self._kv_transfer_config.get_from_extra_config(
             "c2c_checkpoints_dir", None
         )
+        self._tensor_dump_dir: str | None = self._kv_transfer_config.get_from_extra_config(
+            "c2c_tensor_dump_dir", None
+        )
+        self._tensor_dump_layers: set[int] = self._parse_int_set(
+            self._kv_transfer_config.get_from_extra_config(
+                "c2c_tensor_dump_layers", ""
+            )
+        )
+        self._tensor_dump_token_limit: int = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "c2c_tensor_dump_token_limit", 8
+            )
+        )
+        self._fusion_timing: str = self._kv_transfer_config.get_from_extra_config(
+            "c2c_fusion_timing", "post_write"
+        )
         if self._transport == "ipc_manifest":
             os.makedirs(self._dir, exist_ok=True)
         os.makedirs(self._timing_dir, exist_ok=True)
+        if self._tensor_dump_dir is not None:
+            os.makedirs(self._tensor_dump_dir, exist_ok=True)
         # producer worker state: key -> staging tensor (kept alive for IPC)
         self._staged: dict[str, torch.Tensor] = {}
         # per-step accumulation: key -> list[(layer_name, kv_tensor)]
@@ -150,6 +168,16 @@ class C2CConnector(KVConnectorBase_V1):
             self._dir,
             bool(self._checkpoints_dir),
         )
+
+    @staticmethod
+    def _parse_int_set(raw: str | list[int] | tuple[int, ...] | int) -> set[int]:
+        if isinstance(raw, int):
+            return {raw}
+        if isinstance(raw, list) or isinstance(raw, tuple):
+            return {int(part) for part in raw}
+        if not raw:
+            return set()
+        return {int(part.strip()) for part in raw.split(",") if part.strip()}
 
     # ------------------------------------------------------------------
     # Scheduler-side
@@ -506,6 +534,30 @@ class C2CConnector(KVConnectorBase_V1):
         src_k = staged[src_layer, 0, positions].permute(1, 0, 2).unsqueeze(0)
         src_v = staged[src_layer, 1, positions].permute(1, 0, 2).unsqueeze(0)
         fused_k, fused_v = proj((src_k, src_v), (tgt_k, tgt_v))
+        if self._tensor_dump_dir is not None and (
+            not self._tensor_dump_layers or tgt_layer in self._tensor_dump_layers
+        ):
+            n_dump = min(self._tensor_dump_token_limit, positions.numel())
+            dump = {
+                "path": "vllm",
+                "key": req.key,
+                "target_layer": tgt_layer,
+                "source_layer": src_layer,
+                "projector_idx": proj_idx,
+                "positions": positions[:n_dump].detach().cpu(),
+                "slots": slots[:n_dump].detach().cpu(),
+                "source_key": src_k[:, :, :n_dump, :].detach().float().cpu(),
+                "source_value": src_v[:, :, :n_dump, :].detach().float().cpu(),
+                "target_key_before": tgt_k[:, :, :n_dump, :].detach().float().cpu(),
+                "target_value_before": tgt_v[:, :, :n_dump, :].detach().float().cpu(),
+                "fused_key": fused_k[:, :, :n_dump, :].detach().float().cpu(),
+                "fused_value": fused_v[:, :, :n_dump, :].detach().float().cpu(),
+            }
+            out_path = os.path.join(
+                self._tensor_dump_dir,
+                f"{req.key}_layer_{tgt_layer}.pt",
+            )
+            torch.save(dump, out_path)
         flat[0, slots] = fused_k.squeeze(0).permute(1, 0, 2).to(flat.dtype)
         flat[1, slots] = fused_v.squeeze(0).permute(1, 0, 2).to(flat.dtype)
         end_evt.record()
@@ -536,7 +588,11 @@ class C2CConnector(KVConnectorBase_V1):
         kv_layer: torch.Tensor,
         attn_metadata: Any,
     ) -> None:
-        if self._is_producer or self._checkpoints_dir is None:
+        if (
+            self._is_producer
+            or self._checkpoints_dir is None
+            or self._fusion_timing == "deferred"
+        ):
             return
         jobs = list(self._fuse_jobs)
         for req in jobs:
@@ -545,6 +601,20 @@ class C2CConnector(KVConnectorBase_V1):
 
     def wait_for_save(self) -> None:
         if not self._is_producer:
+            if self._checkpoints_dir is None or self._fusion_timing != "deferred":
+                return
+            layer_names = self._ordered_layer_names()
+            jobs = list(self._fuse_jobs)
+            for req in jobs:
+                if req.key not in self._staged:
+                    continue
+                for layer_name in layer_names:
+                    self._run_fusion_layer(
+                        req,
+                        layer_name,
+                        self._kv_caches[layer_name],
+                    )
+            self._fuse_jobs = []
             return
         for key, layers in list(self._pending_layers.items()):
             t0 = time.perf_counter()
