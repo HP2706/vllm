@@ -288,6 +288,22 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def mutate_kv_post_write(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+    ) -> None:
+        """
+        Optionally mutate a layer's paged KV cache after the current step's
+        KV has been written and before attention reads from the cache.
+
+        Connectors that implement cache-to-cache transforms can use this hook
+        to fuse externally staged KV with the receiver's freshly computed KV.
+        The default implementation is a no-op.
+        """
+        return
+
     def handle_preemptions(self, preempted_req_ids: set[str]):
         """
         Handle preempted requests BEFORE their blocks are overwritten.

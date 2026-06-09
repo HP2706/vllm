@@ -647,7 +647,9 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
@@ -659,6 +661,16 @@ def unified_kv_cache_update(
             kv_cache,
             layer_slot_mapping,
         )
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+            is_v1_kv_transfer_group,
+        )
+
+        if has_kv_transfer_group() and is_v1_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            if connector.has_connector_metadata():
+                connector.mutate_kv_post_write(layer_name, kv_cache, attn_metadata)
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
