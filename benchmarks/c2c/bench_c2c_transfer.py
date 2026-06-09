@@ -106,20 +106,29 @@ def _build_prompt(tokenizer: Any, target_tokens: int) -> str:
     return tokenizer.decode(ids)
 
 
-def run(prompt_lengths: tuple[int, ...] = (256, 1024, 4096, 8192)) -> None:
+def run(
+    prompt_lengths: tuple[int, ...] = (256, 1024, 4096, 8192),
+    producer_gpu: str = "0",
+    consumer_gpu: str = "1",
+) -> None:
     os.makedirs(LOG_DIR, exist_ok=True)
     shutil.rmtree(C2C_DIR, ignore_errors=True)
     os.makedirs(C2C_DIR, exist_ok=True)
 
     procs: list[subprocess.Popen[bytes]] = []
-    for model, port, role in [
-        (PRODUCER_MODEL, PRODUCER_PORT, "kv_producer"),
-        (CONSUMER_MODEL, CONSUMER_PORT, "kv_consumer"),
+    for model, port, role, gpu in [
+        (PRODUCER_MODEL, PRODUCER_PORT, "kv_producer", producer_gpu),
+        (CONSUMER_MODEL, CONSUMER_PORT, "kv_consumer", consumer_gpu),
     ]:
         log = open(os.path.join(LOG_DIR, f"server_{port}.txt"), "w")
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu
         procs.append(
             subprocess.Popen(
-                _server_cmd(model, port, role), stdout=log, stderr=subprocess.STDOUT
+                _server_cmd(model, port, role),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
             )
         )
     print("waiting for servers...")
@@ -164,8 +173,15 @@ def run(prompt_lengths: tuple[int, ...] = (256, 1024, 4096, 8192)) -> None:
         row = {
             "prompt_tokens": n_actual,
             "producer_prefill_ms": round(producer_ms, 1),
+            "producer_prefill_tok_s": round(n_actual / (producer_ms / 1000.0), 1),
             "consumer_prefill_solo_ms": round(consumer_solo_ms, 1),
+            "consumer_prefill_solo_tok_s": round(
+                n_actual / (consumer_solo_ms / 1000.0), 1
+            ),
             "consumer_prefill_with_transfer_ms": round(consumer_xfer_ms, 1),
+            "consumer_prefill_with_transfer_tok_s": round(
+                n_actual / (consumer_xfer_ms / 1000.0), 1
+            ),
             "ipc_open_ms": round(latest.get("manifest_open_ms", -1), 3),
             "ipc_copy_ms": round(latest.get("ipc_copy_ms", -1), 3),
             "transfer_bandwidth_gb_s": round(latest.get("bandwidth_gb_s") or -1, 1),
