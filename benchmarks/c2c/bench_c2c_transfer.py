@@ -122,7 +122,7 @@ def run(
     ]:
         log = open(os.path.join(LOG_DIR, f"server_{port}.txt"), "w")
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         procs.append(
             subprocess.Popen(
                 _server_cmd(model, port, role),
