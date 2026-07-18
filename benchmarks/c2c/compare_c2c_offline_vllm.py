@@ -13,7 +13,6 @@ import os
 import signal
 import socket
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -279,6 +278,8 @@ def run_vllm(
     producer_port: int = 8100,
     consumer_port: int = 8200,
     c2c_port: int = 8077,
+    producer_gpu_memory_utilization: float = 0.30,
+    consumer_gpu_memory_utilization: float = 0.50,
 ) -> None:
     assert fuser_dir, "Pass --fuser-dir pointing at the C2C fuser final directory"
     prompts = _load_arc(limit)
@@ -301,10 +302,9 @@ def run_vllm(
         "c2c_port": c2c_port,
         "c2c_timing_dir": str(timing_dir),
         "c2c_checkpoints_dir": fuser_dir,
+        "c2c_fusion_timing": "two_phase",
     }
     common = [
-        "--gpu-memory-utilization",
-        "0.45",
         "--max-model-len",
         "16384",
         "--max-num-batched-tokens",
@@ -329,6 +329,8 @@ def run_vllm(
                     str(producer_port),
                     "--kv-transfer-config",
                     _kv_config("kv_producer", producer_extra),
+                    "--gpu-memory-utilization",
+                    str(producer_gpu_memory_utilization),
                     *common,
                 ],
                 env=prod_env,
@@ -336,6 +338,7 @@ def run_vllm(
                 stderr=subprocess.STDOUT,
             )
         )
+        _wait_port(producer_port)
         processes.append(
             subprocess.Popen(
                 [
@@ -346,6 +349,8 @@ def run_vllm(
                     str(consumer_port),
                     "--kv-transfer-config",
                     _kv_config("kv_consumer", consumer_extra),
+                    "--gpu-memory-utilization",
+                    str(consumer_gpu_memory_utilization),
                     *common,
                 ],
                 env=cons_env,
@@ -353,7 +358,6 @@ def run_vllm(
                 stderr=subprocess.STDOUT,
             )
         )
-        _wait_port(producer_port)
         _wait_port(consumer_port)
         rows: list[dict[str, Any]] = []
         correct = 0
@@ -365,7 +369,6 @@ def run_vllm(
                 enable_thinking=False,
             )
             _, producer_ms = _completion(producer_port, producer_model, prompt_ids, 1)
-            _, fusion_ms = _completion(consumer_port, receiver_model, prompt_ids, 1)
             text_out, answer_ms = _completion(
                 consumer_port, receiver_model, prompt_ids, max_tokens
             )
@@ -380,7 +383,6 @@ def run_vllm(
                     "correct": ok,
                     "text": text_out,
                     "producer_ms": producer_ms,
-                    "fusion_ms": fusion_ms,
                     "answer_ms": answer_ms,
                 }
             )
@@ -389,7 +391,7 @@ def run_vllm(
         producer_log.close()
         consumer_log.close()
     result = {
-        "mode": "vllm_c2c_tcp_post_write",
+        "mode": "vllm_c2c_tcp_two_phase",
         "dataset": "ai2_arc/ARC-Challenge",
         "receiver_model": receiver_model,
         "producer_model": producer_model,

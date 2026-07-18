@@ -518,6 +518,20 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def adjust_num_new_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        """Optionally cap how many tokens the scheduler runs next.
+
+        Connectors that require a model-execution boundary inside prefill can
+        return a smaller positive value. The default preserves the scheduler's
+        chosen token count.
+        """
+        return num_new_tokens
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

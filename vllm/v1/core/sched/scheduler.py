@@ -420,6 +420,13 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
 
+            if self.connector is not None:
+                num_new_tokens = self.connector.adjust_num_new_tokens(
+                    request,
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                )
+
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
@@ -698,6 +705,14 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+
+                    if self.connector is not None:
+                        num_new_tokens = self.connector.adjust_num_new_tokens(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                        )
+                        assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:

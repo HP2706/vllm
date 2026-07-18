@@ -13,10 +13,14 @@ Consumer (receiver model server): pulls the sharer KV device-to-device inside
 its own prefill forward, then at the end of the forward (when its own prompt
 KV exists in the paged cache) applies the per-layer C2C projector and writes
 the fused KV back into its paged blocks. Fusion is pointwise per position and
-causal, so it composes with prefix caching: a follow-up request with the same
-prompt reuses the fused blocks, making every decode token attend to fused KV
-(the offline RosettaModel additionally recomputes the prompt hidden states
-over fused KV; that recompute pass is intentionally skipped here).
+causal, so it composes with prefix caching. Prefix caching is required: cached
+blocks on a C2C consumer must contain KV produced by this same C2C path and must
+not be shared with raw/non-C2C execution.
+
+With ``c2c_fusion_timing="two_phase"``, the consumer prefill is split at the
+Rosetta boundary: tokens ``[0, T-1)`` run as raw receiver prefill, their KV is
+fused after the model step, and token ``T-1`` runs as a one-token continuation
+over the fused prefix before decoding begins.
 
 Consumer extra config:
   c2c_dir: handshake/staging dir (default /dev/shm/c2c_kv)
@@ -25,8 +29,8 @@ Consumer extra config:
     only transfers (Phase A behavior) and never mutates its cache.
 """
 
-import json
 import io
+import json
 import os
 import pickle
 import re
@@ -136,6 +140,14 @@ class C2CConnector(KVConnectorBase_V1):
         self._fusion_timing: str = self._kv_transfer_config.get_from_extra_config(
             "c2c_fusion_timing", "post_write"
         )
+        if self._fusion_timing not in {"post_write", "deferred", "two_phase"}:
+            raise ValueError(f"Unsupported C2C fusion timing: {self._fusion_timing}")
+        if (
+            not self._is_producer
+            and self._checkpoints_dir is not None
+            and not vllm_config.cache_config.enable_prefix_caching
+        ):
+            raise ValueError("C2C fusion requires enable_prefix_caching=True")
         if self._transport == "ipc_manifest":
             os.makedirs(self._dir, exist_ok=True)
         os.makedirs(self._timing_dir, exist_ok=True)
@@ -147,7 +159,6 @@ class C2CConnector(KVConnectorBase_V1):
         self._pending_layers: dict[str, list[tuple[str, torch.Tensor]]] = {}
         # consumer worker state
         self._transferred: set[str] = set()
-        self._fused_ranges: dict[tuple[str, int], int] = {}
         self._fuse_jobs: list[C2CReqMeta] = []
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._projectors: list[torch.nn.Module] | None = None
@@ -196,6 +207,38 @@ class C2CConnector(KVConnectorBase_V1):
     ) -> None:
         return
 
+    def adjust_num_new_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        if (
+            self._is_producer
+            or self._checkpoints_dir is None
+            or self._fusion_timing != "two_phase"
+        ):
+            return num_new_tokens
+        prefix_end = request.num_prompt_tokens - 1
+        if num_computed_tokens < prefix_end:
+            remaining_prefix = prefix_end - num_computed_tokens
+            if num_new_tokens < remaining_prefix:
+                raise ValueError(
+                    "C2C two-phase prefill requires the raw prefix to fit in one "
+                    "scheduler step; increase max_num_batched_tokens"
+                )
+            adjusted = remaining_prefix
+            if adjusted < num_new_tokens:
+                logger.info(
+                    "C2C two-phase prefill: scheduling %d raw prefix tokens "
+                    "at offset %d before final prompt token for request %s",
+                    adjusted,
+                    num_computed_tokens,
+                    request.request_id,
+                )
+            return adjusted
+        return num_new_tokens
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -207,9 +250,15 @@ class C2CConnector(KVConnectorBase_V1):
                 continue
             num_scheduled = scheduler_output.num_scheduled_tokens[new_req.req_id]
             num_computed = new_req.num_computed_tokens
-            # Only handle prefills completing in this single step (allowing a
-            # prefix-cached prefix). Chunked prefill is out of scope.
-            if num_computed + num_scheduled < len(token_ids):
+            scheduled_end = num_computed + num_scheduled
+            is_two_phase_prefix = (
+                not self._is_producer
+                and self._fusion_timing == "two_phase"
+                and scheduled_end == len(token_ids) - 1
+            )
+            # Handle a complete prefill or the raw-prefix phase of a two-phase
+            # consumer prefill. Other chunked prefills remain out of scope.
+            if scheduled_end < len(token_ids) and not is_two_phase_prefix:
                 logger.warning(
                     "C2C: skipping chunked prefill request %s (%d+%d < %d)",
                     new_req.req_id,
@@ -501,13 +550,14 @@ class C2CConnector(KVConnectorBase_V1):
                 req.key,
             )
             return
-        # Fuse positions [start, T-1): resume after any prefix-cached (already
-        # fused) prefix, and exclude the final prompt position, matching the
-        # offline kv_cache_index convention ([1,0]... [-1,0]).
+        # Fuse positions [start, T-1): cached positions before `start` already
+        # belong to this dedicated C2C cache; positions scheduled by this
+        # request must be fused even when the same logical prompt ran before.
+        # Exclude the final prompt position, matching the offline
+        # kv_cache_index convention ([1,0]... [-1,0]).
         layer_names = self._ordered_layer_names()
         tgt_layer = layer_names.index(layer_name)
-        already = self._fused_ranges.get((req.key, tgt_layer), 0)
-        start = max(req.num_computed_tokens, already)
+        start = req.num_computed_tokens
         end = req.num_prompt_tokens - 1
         if start >= end:
             return
@@ -563,7 +613,6 @@ class C2CConnector(KVConnectorBase_V1):
         end_evt.record()
         end_evt.synchronize()
         fusion_ms = start_evt.elapsed_time(end_evt)
-        self._fused_ranges[(req.key, tgt_layer)] = end
         timing = self._timings.get(req.key)
         if timing is not None:
             timing["fusion_ms"] = float(timing["fusion_ms"] or 0.0) + fusion_ms
@@ -591,7 +640,7 @@ class C2CConnector(KVConnectorBase_V1):
         if (
             self._is_producer
             or self._checkpoints_dir is None
-            or self._fusion_timing == "deferred"
+            or self._fusion_timing in {"deferred", "two_phase"}
         ):
             return
         jobs = list(self._fuse_jobs)
@@ -601,7 +650,10 @@ class C2CConnector(KVConnectorBase_V1):
 
     def wait_for_save(self) -> None:
         if not self._is_producer:
-            if self._checkpoints_dir is None or self._fusion_timing != "deferred":
+            if self._checkpoints_dir is None or self._fusion_timing not in {
+                "deferred",
+                "two_phase",
+            }:
                 return
             layer_names = self._ordered_layer_names()
             jobs = list(self._fuse_jobs)
