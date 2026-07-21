@@ -84,6 +84,19 @@ def test_lfru_cache_index_admits_speculation_only_into_free_slots() -> None:
     assert index.resident_experts() == (0, 1)
 
 
+def test_lfru_cache_index_prefers_to_keep_retained_experts() -> None:
+    index = LFRUCacheIndex(capacity=2)
+    index.resolve(0, speculative=True)
+    index.resolve(1, speculative=False)
+    index.set_retained_experts((0,))
+
+    replacement = index.resolve(2, speculative=False)
+
+    assert replacement.evicted_expert_id == 1
+    assert index.resident_experts() == (0, 2)
+    assert index.retained_expert_ids == frozenset({0})
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cached_expert_weights_cold_miss_and_warm_hit() -> None:
     torch.manual_seed(2706)
@@ -125,3 +138,29 @@ def test_cached_expert_weights_oracle_prefetch_avoids_demand_miss() -> None:
     assert metrics["useful_speculations"] == 4
     assert metrics["demand_misses"] == 0
     assert metrics["speculation_precision"] == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cached_expert_weights_activates_restricted_residency_group() -> None:
+    w13 = torch.randn(8, 32, 16, dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn(8, 16, 16, dtype=torch.bfloat16, device="cuda")
+    cache = CachedExpertWeights(
+        capacity=4,
+        w13_weight=w13,
+        w2_weight=w2,
+        experts_per_token=2,
+    )
+
+    expert_ids = cache.stage_residency_group("turn-1", (1, 3, 5, 7))
+    cache.wait_for_experts(expert_ids)
+    torch.cuda.synchronize()
+    cache.activate_residency_group("turn-1", expert_ids, "restricted")
+    logits = torch.zeros((2, 8), dtype=torch.float32, device="cuda")
+    masked = cache.apply_router_mask(logits)
+
+    assert torch.isfinite(masked[:, [1, 3, 5, 7]]).all()
+    assert torch.isneginf(masked[:, [0, 2, 4, 6]]).all()
+    assert cache.index.retained_expert_ids == frozenset({1, 3, 5, 7})
+
+    cache.cancel_residency_group("turn-1")
+    assert torch.equal(cache.apply_router_mask(logits), logits)

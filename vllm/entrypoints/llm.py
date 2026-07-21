@@ -3,7 +3,7 @@
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import cloudpickle
 import torch.nn as nn
@@ -58,6 +58,10 @@ from vllm.v1.sample.logits_processor import LogitsProcessor
 from .offline_utils import _O, _R, OfflineInferenceMixin
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+        ExpertResidencyIntent,
+        ResidencyTicket,
+    )
     from vllm.v1.metrics.reader import Metric
 
 logger = init_logger(__name__)
@@ -610,6 +614,52 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             VRAM!
         """
         return self.llm_engine.apply_model(func)
+
+    def replace_expert_residency_group(
+        self,
+        intents: tuple["ExpertResidencyIntent", ...],
+        *,
+        routing_mode: Literal["fallback", "restricted"] = "fallback",
+    ) -> "ResidencyTicket":
+        """Install one blocking, model-wide MoE residency group.
+
+        This experimental first implementation supports one active agent
+        session and a one-bank expert cache. Call it only while the engine is
+        idle; the method blocks until every layer's staged copies are ready.
+        """
+        from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+            replace_expert_residency_group,
+        )
+
+        def replace_group(model: nn.Module) -> "ResidencyTicket":
+            del model
+            return replace_expert_residency_group(
+                intents,
+                routing_mode=routing_mode,
+            )
+
+        tickets = self.apply_model(replace_group)
+        if len(tickets) != 1:
+            raise RuntimeError(
+                "expert residency groups currently require one model worker"
+            )
+        return tickets[0]
+
+    def cancel_expert_residency_group(self, group_id: str) -> None:
+        """Release a model-wide residency group and unrestricted routing."""
+        from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+            cancel_expert_residency_group,
+        )
+
+        def cancel_group(model: nn.Module) -> None:
+            del model
+            cancel_expert_residency_group(group_id)
+
+        results = self.apply_model(cancel_group)
+        if len(results) != 1:
+            raise RuntimeError(
+                "expert residency groups currently require one model worker"
+            )
 
     def chat(
         self,

@@ -12,10 +12,40 @@ from __future__ import annotations
 import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
 _ACTIVE_CACHES: weakref.WeakSet[CachedExpertWeights] = weakref.WeakSet()
+
+
+@dataclass(frozen=True)
+class ExecutionPoint:
+    """Logical deadline or retention boundary for one agent session."""
+
+    token_index: int
+    layer_index: int
+
+
+@dataclass(frozen=True)
+class ExpertResidencyIntent:
+    """Layer-local expert residency request emitted by any policy."""
+
+    layer_index: int
+    expert_ids: tuple[int, ...]
+    ready_by: ExecutionPoint
+    retain_until: ExecutionPoint | None
+    priority: float
+    group_id: str
+
+
+@dataclass(frozen=True)
+class ResidencyTicket:
+    """Identifier for a staged single-session residency group."""
+
+    group_id: str
+    layer_indices: tuple[int, ...]
+    routing_mode: Literal["fallback", "restricted"]
 
 
 @dataclass(frozen=True)
@@ -58,6 +88,7 @@ class LFRUCacheIndex:
         self.clock = 0
         self.entries: dict[int, CacheEntry] = {}
         self.free_slots = list(reversed(range(capacity)))
+        self.retained_expert_ids: frozenset[int] = frozenset()
 
     def _victim(self, protected_expert_ids: frozenset[int]) -> int:
         if not self.entries:
@@ -69,6 +100,7 @@ class LFRUCacheIndex:
         victim_id = min(
             candidates,
             key=lambda expert_id: (
+                expert_id in self.retained_expert_ids,
                 self.entries[expert_id].frequency
                 / (self.clock - self.entries[expert_id].last_access + 1),
                 self.entries[expert_id].last_access,
@@ -106,6 +138,9 @@ class LFRUCacheIndex:
         else:
             evicted_expert_id = self._victim(protected_expert_ids)
             slot = self.entries.pop(evicted_expert_id).slot
+            self.retained_expert_ids = (
+                self.retained_expert_ids - {evicted_expert_id}
+            )
 
         self.entries[expert_id] = CacheEntry(
             slot=slot,
@@ -123,6 +158,16 @@ class LFRUCacheIndex:
 
     def resident_experts(self) -> tuple[int, ...]:
         return tuple(sorted(self.entries))
+
+    def set_retained_experts(self, expert_ids: Iterable[int]) -> None:
+        """Prefer a resident plan while allowing correctness demand to win."""
+        retained = frozenset(expert_ids)
+        missing = retained - self.entries.keys()
+        if missing:
+            raise RuntimeError(
+                f"cannot retain nonresident experts: {tuple(sorted(missing))}"
+            )
+        self.retained_expert_ids = retained
 
     def admit_speculative(
         self, expert_ids: tuple[int, ...]
@@ -153,6 +198,7 @@ class CachedExpertWeights:
         capacity: int,
         w13_weight: torch.Tensor,
         w2_weight: torch.Tensor,
+        experts_per_token: int = 1,
     ) -> None:
         if w13_weight.shape[0] != w2_weight.shape[0]:
             raise ValueError(
@@ -163,6 +209,12 @@ class CachedExpertWeights:
 
         self.num_experts = int(w13_weight.shape[0])
         self.capacity = min(capacity, self.num_experts)
+        if not 0 < experts_per_token <= self.num_experts:
+            raise ValueError(
+                f"experts_per_token must be in [1, {self.num_experts}], got "
+                f"{experts_per_token}"
+            )
+        self.experts_per_token = experts_per_token
         self.index = LFRUCacheIndex(self.capacity)
         self.device = w13_weight.device
 
@@ -196,6 +248,13 @@ class CachedExpertWeights:
         self.useful_speculations = 0
         self.evictions = 0
         self.bytes_copied = 0
+        self.plan_loads = 0
+        self.layer_index: int | None = None
+        self.active_group_id: str | None = None
+        self.routing_mode: Literal["fallback", "restricted"] = "fallback"
+        self.allowed_expert_mask = torch.ones(
+            (self.num_experts,), dtype=torch.bool, device=self.device
+        )
         self.next_cache: CachedExpertWeights | None = None
         _ACTIVE_CACHES.add(self)
 
@@ -305,16 +364,88 @@ class CachedExpertWeights:
         """Set the next MoE layer to receive same-ID predictions."""
         self.next_cache = next_cache
 
+    def set_layer_index(self, layer_index: int) -> None:
+        """Assign deterministic model order after every cache is constructed."""
+        if layer_index < 0:
+            raise ValueError("layer_index must be non-negative")
+        self.layer_index = layer_index
+
+    def stage_residency_group(
+        self,
+        group_id: str,
+        expert_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """Load a complete layer plan into the one-bank cache.
+
+        The caller must ensure model execution is idle until activation. This
+        first implementation may evict the previous plan while staging.
+        """
+        validated_ids = self._validate_ids(expert_ids)
+        self.index.set_retained_experts(())
+        copied_before = self.bytes_copied
+        self._schedule(validated_ids, speculative=True)
+        if self.bytes_copied > copied_before:
+            self.plan_loads += 1
+        self.active_group_id = group_id
+        return validated_ids
+
+    def wait_for_experts(self, expert_ids: tuple[int, ...]) -> None:
+        """Make the current compute stream wait for staged expert copies."""
+        compute_stream = torch.cuda.current_stream(self.device)
+        for expert_id in expert_ids:
+            slot = self.index.entries[expert_id].slot
+            compute_stream.wait_event(self.slot_ready_events[slot])
+
+    def activate_residency_group(
+        self,
+        group_id: str,
+        expert_ids: tuple[int, ...],
+        routing_mode: Literal["fallback", "restricted"],
+    ) -> None:
+        """Publish a fully staged plan and its optional router restriction."""
+        if self.active_group_id != group_id:
+            raise RuntimeError(
+                f"staged group {self.active_group_id!r} does not match {group_id!r}"
+            )
+        if routing_mode == "restricted" and len(expert_ids) < self.experts_per_token:
+            raise ValueError(
+                f"restricted routing needs at least {self.experts_per_token} experts, "
+                f"got {len(expert_ids)}"
+            )
+        self.index.set_retained_experts(expert_ids)
+        self.allowed_expert_mask.fill_(routing_mode == "fallback")
+        if routing_mode == "restricted":
+            indices = torch.tensor(expert_ids, dtype=torch.long, device=self.device)
+            self.allowed_expert_mask[indices] = True
+        self.routing_mode = routing_mode
+
+    def cancel_residency_group(self, group_id: str) -> None:
+        """Release soft retention and restore unrestricted routing."""
+        if self.active_group_id != group_id:
+            return
+        self.index.set_retained_experts(())
+        self.allowed_expert_mask.fill_(True)
+        self.active_group_id = None
+        self.routing_mode = "fallback"
+
+    def apply_router_mask(self, router_logits: torch.Tensor) -> torch.Tensor:
+        """Restrict routing to an activated plan without changing tensor shape."""
+        if self.routing_mode == "fallback":
+            return router_logits
+        if router_logits.shape[-1] != self.num_experts:
+            raise RuntimeError(
+                f"router has {router_logits.shape[-1]} experts, cache has "
+                f"{self.num_experts}"
+            )
+        return router_logits.masked_fill(~self.allowed_expert_mask, float("-inf"))
+
     @torch.compiler.disable
     def prepare(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
         """Ensure exact router-selected experts are ready for kernel use."""
         expert_ids = self._validate_ids(topk_ids.unique().tolist())
         self._schedule(expert_ids, speculative=False)
 
-        compute_stream = torch.cuda.current_stream(self.device)
-        for expert_id in expert_ids:
-            slot = self.index.entries[expert_id].slot
-            compute_stream.wait_event(self.slot_ready_events[slot])
+        self.wait_for_experts(expert_ids)
 
         remapped_ids = self.expert_to_slot[topk_ids.long()].to(topk_ids.dtype)
         if self.next_cache is not None:
@@ -343,6 +474,8 @@ class CachedExpertWeights:
             "useful_speculations": self.useful_speculations,
             "evictions": self.evictions,
             "bytes_copied": self.bytes_copied,
+            "plan_loads": self.plan_loads,
+            "retained_experts": len(self.index.retained_expert_ids),
             "cpu_bytes": self.cpu_bytes,
             "gpu_bytes": self.gpu_bytes,
             "hit_rate": hit_rate,
@@ -358,6 +491,69 @@ class CachedExpertWeights:
         self.useful_speculations = 0
         self.evictions = 0
         self.bytes_copied = 0
+        self.plan_loads = 0
+
+
+def _ordered_active_caches() -> tuple[CachedExpertWeights, ...]:
+    caches = tuple(_ACTIVE_CACHES)
+    if not caches:
+        raise RuntimeError("no live expert caches are registered")
+    if any(cache.layer_index is None for cache in caches):
+        raise RuntimeError("expert cache layer indices have not been linked")
+    ordered = tuple(sorted(caches, key=lambda cache: int(cache.layer_index)))
+    indices = tuple(int(cache.layer_index) for cache in ordered)
+    if indices != tuple(range(len(ordered))):
+        raise RuntimeError(f"expert cache layer indices are not contiguous: {indices}")
+    return ordered
+
+
+def replace_expert_residency_group(
+    intents: tuple[ExpertResidencyIntent, ...],
+    *,
+    routing_mode: Literal["fallback", "restricted"] = "fallback",
+) -> ResidencyTicket:
+    """Blocking one-bank replacement for a single active agent session."""
+    if not intents:
+        raise ValueError("at least one residency intent is required")
+    group_ids = {intent.group_id for intent in intents}
+    if len(group_ids) != 1:
+        raise ValueError("all residency intents must share one group_id")
+    group_id = next(iter(group_ids))
+    caches = _ordered_active_caches()
+    by_layer = {intent.layer_index: intent for intent in intents}
+    expected_layers = set(range(len(caches)))
+    if set(by_layer) != expected_layers:
+        raise ValueError(
+            "a replacement group must specify every MoE layer; expected "
+            f"{tuple(sorted(expected_layers))}, got {tuple(sorted(by_layer))}"
+        )
+    staged_ids: list[tuple[int, ...]] = []
+    for layer_index, cache in enumerate(caches):
+        intent = by_layer[layer_index]
+        if intent.ready_by.layer_index != layer_index:
+            raise ValueError(
+                f"layer {layer_index} intent has deadline for layer "
+                f"{intent.ready_by.layer_index}"
+            )
+        staged_ids.append(
+            cache.stage_residency_group(group_id, intent.expert_ids)
+        )
+    for cache, expert_ids in zip(caches, staged_ids):
+        cache.wait_for_experts(expert_ids)
+    torch.cuda.current_stream(caches[0].device).synchronize()
+    for cache, expert_ids in zip(caches, staged_ids):
+        cache.activate_residency_group(group_id, expert_ids, routing_mode)
+    return ResidencyTicket(
+        group_id=group_id,
+        layer_indices=tuple(range(len(caches))),
+        routing_mode=routing_mode,
+    )
+
+
+def cancel_expert_residency_group(group_id: str) -> None:
+    """Cancel the active single-session group on every cached MoE layer."""
+    for cache in _ordered_active_caches():
+        cache.cancel_residency_group(group_id)
 
 
 def aggregate_expert_cache_metrics() -> dict[str, int | float]:
@@ -382,6 +578,8 @@ def aggregate_expert_cache_metrics() -> dict[str, int | float]:
         "useful_speculations": useful_speculations,
         "evictions": sum(int(item["evictions"]) for item in metrics),
         "bytes_copied": sum(int(item["bytes_copied"]) for item in metrics),
+        "plan_loads": sum(int(item["plan_loads"]) for item in metrics),
+        "retained_experts": sum(int(item["retained_experts"]) for item in metrics),
         "cpu_bytes": sum(int(item["cpu_bytes"]) for item in metrics),
         "gpu_bytes": sum(int(item["gpu_bytes"]) for item in metrics),
         "hit_rate": hits / demand_accesses if demand_accesses > 0 else 0.0,

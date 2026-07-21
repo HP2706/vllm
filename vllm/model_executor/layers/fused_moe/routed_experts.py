@@ -229,6 +229,7 @@ class RoutedExperts(PluggableLayer):
             capacity=self.expert_weight_cache_size,
             w13_weight=self.w13_weight.data,
             w2_weight=self.w2_weight.data,
+            experts_per_token=self.moe_config.experts_per_token,
         )
         self.expert_weight_cache = cache
         replace_parameter(
@@ -260,6 +261,14 @@ class RoutedExperts(PluggableLayer):
                 topk_ids=topk_ids,
             )
         return self.expert_weight_cache.prepare(topk_ids)
+
+    def apply_expert_residency_mask(
+        self, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply an activated restricted plan before modular top-k routing."""
+        if self.expert_weight_cache is None:
+            return router_logits
+        return self.expert_weight_cache.apply_router_mask(router_logits)
 
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
@@ -1322,9 +1331,10 @@ def link_expert_weight_caches(model: torch.nn.Module) -> None:
         and module.expert_weight_cache is not None
     ]
     caches: list[CachedExpertWeights] = []
-    for layer in cached_layers:
+    for layer_index, layer in enumerate(cached_layers):
         cache = layer.expert_weight_cache
         assert cache is not None
+        cache.set_layer_index(layer_index)
         cache.set_next_cache(None)
         caches.append(cache)
     linked_layers = 0

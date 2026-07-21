@@ -570,6 +570,9 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
+            router_logits = self.routed_experts.apply_expert_residency_mask(
+                router_logits
+            )
             topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
