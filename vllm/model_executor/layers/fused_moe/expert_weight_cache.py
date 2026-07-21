@@ -56,6 +56,34 @@ class ResidencyTicket:
     routing_mode: Literal["fallback", "restricted"]
 
 
+@dataclass
+class OracleLookaheadState:
+    """Recorded decode routes used only for controlled lookahead benchmarks."""
+
+    routes: tuple[tuple[tuple[int, ...], ...], ...]
+    caches: tuple[CachedExpertWeights, ...]
+    lookahead_layers: int
+    calls_by_layer: list[int]
+
+    def prefetch_from(self, layer_index: int) -> None:
+        token_index = self.calls_by_layer[layer_index]
+        self.calls_by_layer[layer_index] += 1
+        if self.lookahead_layers == 0:
+            return
+        target_position = (
+            token_index * len(self.caches)
+            + layer_index
+            + self.lookahead_layers
+        )
+        target_token = target_position // len(self.caches)
+        target_layer = target_position % len(self.caches)
+        if target_token >= len(self.routes):
+            return
+        self.caches[target_layer].prefetch_replacing_expert_ids(
+            self.routes[target_token][target_layer]
+        )
+
+
 @dataclass(frozen=True)
 class ExpertWeightResult:
     """GPU-resident weights and cache-slot-remapped router output."""
@@ -266,6 +294,7 @@ class CachedExpertWeights:
             (self.num_experts,), dtype=torch.bool, device=self.device
         )
         self.next_cache: CachedExpertWeights | None = None
+        self.oracle_lookahead_state: OracleLookaheadState | None = None
         _ACTIVE_CACHES.add(self)
 
     @staticmethod
@@ -370,6 +399,14 @@ class CachedExpertWeights:
         self.skipped_speculations += skipped
         self._schedule(admitted_ids, speculative=True)
 
+    def prefetch_replacing_expert_ids(
+        self,
+        predicted_expert_ids: tuple[int, ...],
+    ) -> None:
+        """Prefetch an oracle set, allowing it to replace dynamic entries."""
+        expert_ids = self._validate_ids(predicted_expert_ids)
+        self._schedule(expert_ids, speculative=True)
+
     def set_next_cache(self, next_cache: CachedExpertWeights | None) -> None:
         """Set the next MoE layer to receive same-ID predictions."""
         self.next_cache = next_cache
@@ -434,6 +471,8 @@ class CachedExpertWeights:
                 f"got {len(expert_ids)}"
             )
         self.index.set_retained_experts(expert_ids)
+        for expert_id in expert_ids:
+            self.index.entries[expert_id].speculative = False
         self.allowed_expert_mask.fill_(routing_mode == "fallback")
         if routing_mode == "restricted":
             indices = torch.tensor(expert_ids, dtype=torch.long, device=self.device)
@@ -455,6 +494,18 @@ class CachedExpertWeights:
         self.active_group_id = None
         self.routing_mode = "fallback"
 
+    def reset_contents(self) -> None:
+        """Clear residency state while preserving allocated CPU/GPU buffers."""
+        self.index = LFRUCacheIndex(self.capacity)
+        self.expert_to_slot.fill_(-1)
+        self.active_group_id = None
+        self.staged_group_id = None
+        self.staged_expert_ids = ()
+        self.routing_mode = "fallback"
+        self.allowed_expert_mask.fill_(True)
+        self.oracle_lookahead_state = None
+        self.reset_metrics()
+
     def apply_router_mask(self, router_logits: torch.Tensor) -> torch.Tensor:
         """Restrict routing to an activated plan without changing tensor shape."""
         if self.routing_mode == "fallback":
@@ -469,6 +520,14 @@ class CachedExpertWeights:
     @torch.compiler.disable
     def prepare(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
         """Ensure exact router-selected experts are ready for kernel use."""
+        if self.oracle_lookahead_state is not None:
+            if self.layer_index is None:
+                raise RuntimeError("oracle lookahead requires a linked layer index")
+            if topk_ids.shape[0] != 1:
+                raise RuntimeError(
+                    "oracle lookahead benchmark supports decode batch size one"
+                )
+            self.oracle_lookahead_state.prefetch_from(self.layer_index)
         expert_ids = self._validate_ids(topk_ids.unique().tolist())
         self._schedule(expert_ids, speculative=False)
 
@@ -532,6 +591,53 @@ def _ordered_active_caches() -> tuple[CachedExpertWeights, ...]:
     if indices != tuple(range(len(ordered))):
         raise RuntimeError(f"expert cache layer indices are not contiguous: {indices}")
     return ordered
+
+
+def reset_expert_weight_cache_contents() -> None:
+    """Synchronously clear all slots for a controlled single-worker replay."""
+    if _STAGING_TASKS:
+        raise RuntimeError("cannot reset while an expert group is staging")
+    caches = _ordered_active_caches()
+    torch.cuda.synchronize(caches[0].device)
+    for cache in caches:
+        cache.reset_contents()
+
+
+def configure_oracle_expert_lookahead(
+    routes: tuple[tuple[tuple[int, ...], ...], ...],
+    lookahead_layers: int,
+) -> None:
+    """Enable recorded-route lookahead instrumentation for decode benchmarks."""
+    if lookahead_layers < 0:
+        raise ValueError("lookahead_layers must be non-negative")
+    caches = _ordered_active_caches()
+    if not routes:
+        raise ValueError("at least one token of recorded routes is required")
+    if any(len(token_routes) != len(caches) for token_routes in routes):
+        raise ValueError("every recorded token must specify every MoE layer")
+    for token_routes in routes:
+        for layer_index, expert_ids in enumerate(token_routes):
+            caches[layer_index]._validate_ids(expert_ids)
+    state = OracleLookaheadState(
+        routes=routes,
+        caches=caches,
+        lookahead_layers=lookahead_layers,
+        calls_by_layer=[0] * len(caches),
+    )
+    for cache in caches:
+        cache.oracle_lookahead_state = state
+
+
+def disable_oracle_expert_lookahead() -> tuple[int, ...]:
+    """Disable instrumentation and return decode calls observed per layer."""
+    caches = _ordered_active_caches()
+    state = caches[0].oracle_lookahead_state
+    if state is None:
+        raise RuntimeError("oracle lookahead is not enabled")
+    calls = tuple(state.calls_by_layer)
+    for cache in caches:
+        cache.oracle_lookahead_state = None
+    return calls
 
 
 def _validate_residency_intents(
