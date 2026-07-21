@@ -165,6 +165,10 @@ def test_cached_expert_weights_activates_restricted_residency_group() -> None:
     assert torch.isfinite(masked[:, [1, 3, 5, 7]]).all()
     assert torch.isneginf(masked[:, [0, 2, 4, 6]]).all()
     assert cache.index.retained_expert_ids == frozenset({1, 3, 5, 7})
+    assert all(
+        not cache.index.entries[expert_id].speculative
+        for expert_id in expert_ids
+    )
 
     cache.cancel_residency_group("turn-1")
     assert torch.equal(cache.apply_router_mask(logits), logits)
