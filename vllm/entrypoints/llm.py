@@ -645,6 +645,27 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             )
         return tickets[0]
 
+    def enable_expert_weight_cache(self, capacity: int) -> int:
+        """Compact full MoE weights into bounded caches after normal prefill.
+
+        The engine must be idle. This blocking single-worker transition keeps
+        the KV cache intact so a caller can prefill with full residency, then
+        install and reuse a turn-scoped expert plan during decode.
+        """
+        from vllm.model_executor.layers.fused_moe.routed_experts import (
+            initialize_expert_weight_caches,
+        )
+
+        def initialize(model: nn.Module) -> int:
+            return initialize_expert_weight_caches(model, capacity)
+
+        layer_counts = self.apply_model(initialize)
+        if len(layer_counts) != 1:
+            raise RuntimeError(
+                "runtime expert-cache compaction currently requires one model worker"
+            )
+        return layer_counts[0]
+
     def cancel_expert_residency_group(self, group_id: str) -> None:
         """Release a model-wide residency group and unrestricted routing."""
         from vllm.model_executor.layers.fused_moe.expert_weight_cache import (

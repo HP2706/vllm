@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -1348,6 +1349,40 @@ def link_expert_weight_caches(model: torch.nn.Module) -> None:
             linked_layers,
             len(cached_layers),
         )
+
+
+def initialize_expert_weight_caches(
+    model: torch.nn.Module,
+    capacity: int,
+) -> int:
+    """Compact fully resident unquantized experts into bounded GPU caches.
+
+    This blocking transition is intended for an idle single-session engine
+    after normal prefill. It preserves the KV cache while moving complete MoE
+    tensors to pinned CPU memory and retaining only ``capacity`` slots per
+    layer on the GPU.
+    """
+    if capacity <= 0:
+        raise ValueError(f"capacity must be positive, got {capacity}")
+    layers = [
+        module for module in model.modules() if isinstance(module, RoutedExperts)
+    ]
+    if not layers:
+        raise RuntimeError("model has no routed-expert layers")
+    for layer in layers:
+        if layer.expert_weight_cache is not None:
+            raise RuntimeError("expert weight caches are already initialized")
+        if not isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
+            raise NotImplementedError(
+                "runtime expert-cache compaction currently supports only "
+                "unquantized fused MoE layers"
+            )
+        layer.expert_weight_cache_size = capacity
+        layer.init_expert_weight_cache()
+    link_expert_weight_caches(model)
+    gc.collect()
+    torch.cuda.empty_cache()
+    return len(layers)
 
 
 # Mark the RoutedExperts weight_loader as supporting MoE-specific parameters
