@@ -11,12 +11,20 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
 
 _ACTIVE_CACHES: weakref.WeakSet[CachedExpertWeights] = weakref.WeakSet()
+_STAGING_TASKS: dict[
+    str,
+    tuple[
+        ThreadPoolExecutor,
+        Future[tuple[tuple[int, ...], ...]],
+    ],
+] = {}
 
 
 @dataclass(frozen=True)
@@ -251,6 +259,8 @@ class CachedExpertWeights:
         self.plan_loads = 0
         self.layer_index: int | None = None
         self.active_group_id: str | None = None
+        self.staged_group_id: str | None = None
+        self.staged_expert_ids: tuple[int, ...] = ()
         self.routing_mode: Literal["fallback", "restricted"] = "fallback"
         self.allowed_expert_mask = torch.ones(
             (self.num_experts,), dtype=torch.bool, device=self.device
@@ -381,12 +391,21 @@ class CachedExpertWeights:
         first implementation may evict the previous plan while staging.
         """
         validated_ids = self._validate_ids(expert_ids)
+        if self.staged_group_id is not None:
+            raise RuntimeError(
+                f"group {self.staged_group_id!r} is already staged; activate or "
+                "cancel it before staging another group"
+            )
+        self.active_group_id = None
+        self.routing_mode = "fallback"
+        self.allowed_expert_mask.fill_(True)
         self.index.set_retained_experts(())
         copied_before = self.bytes_copied
         self._schedule(validated_ids, speculative=True)
         if self.bytes_copied > copied_before:
             self.plan_loads += 1
-        self.active_group_id = group_id
+        self.staged_group_id = group_id
+        self.staged_expert_ids = validated_ids
         return validated_ids
 
     def wait_for_experts(self, expert_ids: tuple[int, ...]) -> None:
@@ -403,10 +422,12 @@ class CachedExpertWeights:
         routing_mode: Literal["fallback", "restricted"],
     ) -> None:
         """Publish a fully staged plan and its optional router restriction."""
-        if self.active_group_id != group_id:
+        if self.staged_group_id != group_id:
             raise RuntimeError(
-                f"staged group {self.active_group_id!r} does not match {group_id!r}"
+                f"staged group {self.staged_group_id!r} does not match {group_id!r}"
             )
+        if expert_ids != self.staged_expert_ids:
+            raise RuntimeError("activated expert IDs do not match the staged plan")
         if routing_mode == "restricted" and len(expert_ids) < self.experts_per_token:
             raise ValueError(
                 f"restricted routing needs at least {self.experts_per_token} experts, "
@@ -418,9 +439,15 @@ class CachedExpertWeights:
             indices = torch.tensor(expert_ids, dtype=torch.long, device=self.device)
             self.allowed_expert_mask[indices] = True
         self.routing_mode = routing_mode
+        self.active_group_id = group_id
+        self.staged_group_id = None
+        self.staged_expert_ids = ()
 
     def cancel_residency_group(self, group_id: str) -> None:
         """Release soft retention and restore unrestricted routing."""
+        if self.staged_group_id == group_id:
+            self.staged_group_id = None
+            self.staged_expert_ids = ()
         if self.active_group_id != group_id:
             return
         self.index.set_retained_experts(())
@@ -507,12 +534,13 @@ def _ordered_active_caches() -> tuple[CachedExpertWeights, ...]:
     return ordered
 
 
-def replace_expert_residency_group(
+def _validate_residency_intents(
     intents: tuple[ExpertResidencyIntent, ...],
-    *,
-    routing_mode: Literal["fallback", "restricted"] = "fallback",
-) -> ResidencyTicket:
-    """Blocking one-bank replacement for a single active agent session."""
+) -> tuple[
+    str,
+    tuple[CachedExpertWeights, ...],
+    dict[int, ExpertResidencyIntent],
+]:
     if not intents:
         raise ValueError("at least one residency intent is required")
     group_ids = {intent.group_id for intent in intents}
@@ -521,28 +549,61 @@ def replace_expert_residency_group(
     group_id = next(iter(group_ids))
     caches = _ordered_active_caches()
     by_layer = {intent.layer_index: intent for intent in intents}
+    if len(by_layer) != len(intents):
+        raise ValueError("a replacement group contains duplicate layer intents")
     expected_layers = set(range(len(caches)))
     if set(by_layer) != expected_layers:
         raise ValueError(
             "a replacement group must specify every MoE layer; expected "
             f"{tuple(sorted(expected_layers))}, got {tuple(sorted(by_layer))}"
         )
-    staged_ids: list[tuple[int, ...]] = []
-    for layer_index, cache in enumerate(caches):
+    for layer_index in range(len(caches)):
         intent = by_layer[layer_index]
         if intent.ready_by.layer_index != layer_index:
             raise ValueError(
                 f"layer {layer_index} intent has deadline for layer "
                 f"{intent.ready_by.layer_index}"
             )
-        staged_ids.append(
-            cache.stage_residency_group(group_id, intent.expert_ids)
+        caches[layer_index]._validate_ids(intent.expert_ids)
+        if caches[layer_index].staged_group_id is not None:
+            raise RuntimeError(
+                f"layer {layer_index} already has staged group "
+                f"{caches[layer_index].staged_group_id!r}"
+            )
+    return group_id, caches, by_layer
+
+
+def stage_expert_residency_group(
+    intents: tuple[ExpertResidencyIntent, ...],
+    *,
+    routing_mode: Literal["fallback", "restricted"] = "fallback",
+) -> ResidencyTicket:
+    """Start staging one model-wide plan on a background worker thread.
+
+    This one-bank implementation can overwrite experts from the active plan.
+    The engine therefore must remain idle from staging through activation.
+    """
+    group_id, caches, by_layer = _validate_residency_intents(intents)
+    if _STAGING_TASKS:
+        raise RuntimeError(
+            "one residency group is already staged; activate or cancel it first"
         )
-    for cache, expert_ids in zip(caches, staged_ids):
-        cache.wait_for_experts(expert_ids)
-    torch.cuda.current_stream(caches[0].device).synchronize()
-    for cache, expert_ids in zip(caches, staged_ids):
-        cache.activate_residency_group(group_id, expert_ids, routing_mode)
+
+    def stage_all_layers() -> tuple[tuple[int, ...], ...]:
+        return tuple(
+            cache.stage_residency_group(
+                group_id,
+                by_layer[layer_index].expert_ids,
+            )
+            for layer_index, cache in enumerate(caches)
+        )
+
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="vllm-expert-stage",
+    )
+    future = executor.submit(stage_all_layers)
+    _STAGING_TASKS[group_id] = (executor, future)
     return ResidencyTicket(
         group_id=group_id,
         layer_indices=tuple(range(len(caches))),
@@ -550,8 +611,57 @@ def replace_expert_residency_group(
     )
 
 
+def activate_expert_residency_group(ticket: ResidencyTicket) -> None:
+    """Wait for a staged model-wide plan and make it authoritative."""
+    caches = _ordered_active_caches()
+    expected_layers = tuple(range(len(caches)))
+    if ticket.layer_indices != expected_layers:
+        raise ValueError(
+            f"ticket layers {ticket.layer_indices} do not match {expected_layers}"
+        )
+    task = _STAGING_TASKS.pop(ticket.group_id, None)
+    if task is None:
+        raise RuntimeError(f"group {ticket.group_id!r} has not been staged")
+    executor, future = task
+    staged_ids = future.result()
+    executor.shutdown(wait=True)
+    for cache, expert_ids in zip(caches, staged_ids):
+        if cache.staged_group_id != ticket.group_id:
+            raise RuntimeError(
+                f"layer {cache.layer_index} staged group "
+                f"{cache.staged_group_id!r} does not match {ticket.group_id!r}"
+            )
+        cache.wait_for_experts(expert_ids)
+    torch.cuda.current_stream(caches[0].device).synchronize()
+    for cache, expert_ids in zip(caches, staged_ids):
+        cache.activate_residency_group(
+            ticket.group_id,
+            expert_ids,
+            ticket.routing_mode,
+        )
+
+
+def replace_expert_residency_group(
+    intents: tuple[ExpertResidencyIntent, ...],
+    *,
+    routing_mode: Literal["fallback", "restricted"] = "fallback",
+) -> ResidencyTicket:
+    """Blocking one-bank replacement for a single active agent session."""
+    ticket = stage_expert_residency_group(
+        intents,
+        routing_mode=routing_mode,
+    )
+    activate_expert_residency_group(ticket)
+    return ticket
+
+
 def cancel_expert_residency_group(group_id: str) -> None:
     """Cancel the active single-session group on every cached MoE layer."""
+    task = _STAGING_TASKS.pop(group_id, None)
+    if task is not None:
+        executor, future = task
+        future.result()
+        executor.shutdown(wait=True)
     for cache in _ordered_active_caches():
         cache.cancel_residency_group(group_id)
 

@@ -645,6 +645,55 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             )
         return tickets[0]
 
+    def stage_expert_residency_group(
+        self,
+        intents: tuple["ExpertResidencyIntent", ...],
+        *,
+        routing_mode: Literal["fallback", "restricted"] = "fallback",
+    ) -> "ResidencyTicket":
+        """Start staging a model-wide MoE plan and return immediately.
+
+        The engine must remain idle until
+        :meth:`activate_expert_residency_group` completes. The current
+        one-bank cache may overwrite experts belonging to the active plan.
+        """
+        from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+            stage_expert_residency_group,
+        )
+
+        def stage_group(model: nn.Module) -> "ResidencyTicket":
+            del model
+            return stage_expert_residency_group(
+                intents,
+                routing_mode=routing_mode,
+            )
+
+        tickets = self.apply_model(stage_group)
+        if len(tickets) != 1:
+            raise RuntimeError(
+                "expert residency groups currently require one model worker"
+            )
+        return tickets[0]
+
+    def activate_expert_residency_group(
+        self,
+        ticket: "ResidencyTicket",
+    ) -> None:
+        """Wait for a previously staged MoE plan and publish it atomically."""
+        from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+            activate_expert_residency_group,
+        )
+
+        def activate_group(model: nn.Module) -> None:
+            del model
+            activate_expert_residency_group(ticket)
+
+        results = self.apply_model(activate_group)
+        if len(results) != 1:
+            raise RuntimeError(
+                "expert residency groups currently require one model worker"
+            )
+
     def enable_expert_weight_cache(self, capacity: int) -> int:
         """Compact full MoE weights into bounded caches after normal prefill.
 

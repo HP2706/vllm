@@ -152,9 +152,13 @@ def test_cached_expert_weights_activates_restricted_residency_group() -> None:
     )
 
     expert_ids = cache.stage_residency_group("turn-1", (1, 3, 5, 7))
+    assert cache.active_group_id is None
+    assert cache.staged_group_id == "turn-1"
     cache.wait_for_experts(expert_ids)
     torch.cuda.synchronize()
     cache.activate_residency_group("turn-1", expert_ids, "restricted")
+    assert cache.active_group_id == "turn-1"
+    assert cache.staged_group_id is None
     logits = torch.zeros((2, 8), dtype=torch.float32, device="cuda")
     masked = cache.apply_router_mask(logits)
 
