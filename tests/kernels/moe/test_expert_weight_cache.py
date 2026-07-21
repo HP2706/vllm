@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+    CachedExpertWeights,
+    LFRUCacheIndex,
+)
+
+
+def test_lfru_cache_index_reuses_slots_and_tracks_hits() -> None:
+    index = LFRUCacheIndex(capacity=2)
+
+    first = index.resolve(4, speculative=False)
+    second = index.resolve(7, speculative=False)
+    repeated = index.resolve(4, speculative=False)
+
+    assert not first.hit
+    assert not second.hit
+    assert repeated.hit
+    assert repeated.slot == first.slot
+    assert index.resident_experts() == (4, 7)
+
+
+def test_lfru_cache_index_recognizes_useful_speculation() -> None:
+    index = LFRUCacheIndex(capacity=2)
+
+    prefetched = index.resolve(3, speculative=True)
+    demanded = index.resolve(3, speculative=False)
+    demanded_again = index.resolve(3, speculative=False)
+
+    assert not prefetched.hit
+    assert demanded.hit
+    assert demanded.useful_speculation
+    assert demanded_again.hit
+    assert not demanded_again.useful_speculation
+
+
+def test_lfru_cache_index_evicts_low_frequency_entry() -> None:
+    index = LFRUCacheIndex(capacity=2)
+    index.resolve(0, speculative=False)
+    index.resolve(1, speculative=False)
+    for _ in range(5):
+        index.resolve(0, speculative=False)
+
+    replacement = index.resolve(2, speculative=False)
+
+    assert replacement.evicted_expert_id == 1
+    assert index.resident_experts() == (0, 2)
+
+
+def test_lfru_cache_index_does_not_evict_a_requested_hit() -> None:
+    index = LFRUCacheIndex(capacity=2)
+    index.resolve(0, speculative=False)
+    for _ in range(5):
+        index.resolve(1, speculative=False)
+
+    requested = frozenset({0, 2})
+    hit = index.resolve(
+        0, speculative=False, protected_expert_ids=requested
+    )
+    miss = index.resolve(
+        2, speculative=False, protected_expert_ids=requested
+    )
+
+    assert hit.hit
+    assert miss.evicted_expert_id == 1
+    assert index.resident_experts() == (0, 2)
+
+
+def test_lfru_cache_index_admits_speculation_only_into_free_slots() -> None:
+    index = LFRUCacheIndex(capacity=3)
+    index.resolve(0, speculative=False)
+    index.resolve(1, speculative=False)
+
+    admitted, skipped = index.admit_speculative((0, 2, 3, 4))
+
+    assert admitted == (2,)
+    assert skipped == 2
+    assert index.resident_experts() == (0, 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cached_expert_weights_cold_miss_and_warm_hit() -> None:
+    torch.manual_seed(2706)
+    w13 = torch.randn(8, 32, 16, dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn(8, 16, 16, dtype=torch.bfloat16, device="cuda")
+    expected_w13 = w13.cpu()
+    expected_w2 = w2.cpu()
+    cache = CachedExpertWeights(capacity=4, w13_weight=w13, w2_weight=w2)
+    ids = torch.tensor([[1, 3, 5, 7]], dtype=torch.int32, device="cuda")
+
+    cold = cache.prepare(ids)
+    torch.cuda.synchronize()
+    for expert_id, slot in zip(ids[0].tolist(), cold.topk_ids[0].tolist()):
+        torch.testing.assert_close(cold.w13_weight[slot].cpu(), expected_w13[expert_id])
+        torch.testing.assert_close(cold.w2_weight[slot].cpu(), expected_w2[expert_id])
+
+    warm = cache.prepare(ids)
+    torch.cuda.synchronize()
+    assert torch.equal(cold.topk_ids, warm.topk_ids)
+    assert cache.metrics()["demand_misses"] == 4
+    assert cache.metrics()["hits"] == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cached_expert_weights_oracle_prefetch_avoids_demand_miss() -> None:
+    w13 = torch.randn(8, 32, 16, dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn(8, 16, 16, dtype=torch.bfloat16, device="cuda")
+    cache = CachedExpertWeights(capacity=4, w13_weight=w13, w2_weight=w2)
+    ids = torch.tensor([[0, 2, 4, 6]], dtype=torch.int32, device="cuda")
+
+    cache.prefetch(ids)
+    result = cache.prepare(ids)
+    torch.cuda.synchronize()
+
+    assert result.topk_ids.min().item() >= 0
+    assert result.topk_ids.max().item() < cache.capacity
+    metrics = cache.metrics()
+    assert metrics["speculative_loads"] == 4
+    assert metrics["useful_speculations"] == 4
+    assert metrics["demand_misses"] == 0
+    assert metrics["speculation_precision"] == 1.0

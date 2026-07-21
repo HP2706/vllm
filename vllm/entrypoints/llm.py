@@ -123,6 +123,11 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             the model weights. This virtually increases the GPU memory space
             you can use to hold the model weights, at the cost of CPU-GPU data
             transfer for every forward pass.
+        moe_expert_cache_size: Number of expert slots retained on each GPU for
+            experimental expert-granular CPU offloading. Zero disables it.
+        moe_expert_prefetch_mode: Speculative expert policy. The experimental
+            ``same_id_next_layer`` policy prefetches the same expert IDs for
+            the following MoE layer.
         offload_group_size: Prefetch offloading: Group every N layers
             together. Offload last `offload_num_in_group` layers of each group.
             Default is 0 (disabled).
@@ -194,6 +199,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         seed: int = 0,
         gpu_memory_utilization: float = 0.92,
         cpu_offload_gb: float = 0,
+        moe_expert_cache_size: int = 0,
+        moe_expert_prefetch_mode: str = "none",
         offload_group_size: int = 0,
         offload_num_in_group: int = 1,
         offload_prefetch_step: int = 1,
@@ -310,6 +317,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             gpu_memory_utilization=gpu_memory_utilization,
             kv_cache_memory_bytes=kv_cache_memory_bytes,
             cpu_offload_gb=cpu_offload_gb,
+            moe_expert_cache_size=moe_expert_cache_size,
+            moe_expert_prefetch_mode=moe_expert_prefetch_mode,
             offload_group_size=offload_group_size,
             offload_num_in_group=offload_num_in_group,
             offload_prefetch_step=offload_prefetch_step,

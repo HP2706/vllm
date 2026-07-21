@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
 from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch"]
+MoEExpertPrefetchMode = Literal["none", "same_id_next_layer"]
 
 
 @config
@@ -94,9 +95,27 @@ class OffloadConfig:
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
 
+    moe_expert_cache_size: int = Field(default=0, ge=0)
+    """Number of expert slots kept on each GPU for experimental MoE expert
+    caching. Zero disables the cache. The first implementation supports only
+    eager, single-GPU, unquantized ``FusedMoE`` models such as Qwen3 MoE.
+    Complete expert weights are retained in pinned CPU memory.
+    """
+
+    moe_expert_prefetch_mode: MoEExpertPrefetchMode = "none"
+    """Speculative policy for an enabled MoE expert cache. ``none`` loads
+    experts only after routing. ``same_id_next_layer`` uses one layer's routed
+    expert IDs as predictions for the following MoE layer and overlaps their
+    H2D copies with intervening GPU work.
+    """
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
+        if self.moe_expert_prefetch_mode != "none" and self.moe_expert_cache_size == 0:
+            raise ValueError(
+                "moe_expert_prefetch_mode requires moe_expert_cache_size > 0"
+            )
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(

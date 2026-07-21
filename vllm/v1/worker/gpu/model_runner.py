@@ -38,6 +38,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.routed_experts import (
+    link_expert_weight_caches,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -314,6 +317,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
+            link_expert_weight_caches(self.model)
             if self.speculator is not None:
                 prepare_communication_buffer_for_model(self.speculator.model)
 

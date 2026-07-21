@@ -59,6 +59,9 @@ from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.fused_moe.routed_experts import (
+    link_expert_weight_caches,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -5350,6 +5353,7 @@ class GPUModelRunner(
         )
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
+            link_expert_weight_caches(self.model)
             if (drafter := getattr(self, "drafter", None)) and (
                 drafter_model := getattr(drafter, "model", None)
             ):

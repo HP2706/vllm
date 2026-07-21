@@ -517,6 +517,8 @@ class EngineArgs:
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
     offload_backend: str = OffloadConfig.offload_backend
+    moe_expert_cache_size: int = OffloadConfig.moe_expert_cache_size
+    moe_expert_prefetch_mode: str = OffloadConfig.moe_expert_prefetch_mode
     cpu_offload_gb: float = UVAOffloadConfig.cpu_offload_gb
     cpu_offload_params: set[str] = get_field(UVAOffloadConfig, "cpu_offload_params")
     offload_group_size: int = PrefetchOffloadConfig.offload_group_size
@@ -1218,6 +1220,13 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--offload-backend", **offload_kwargs["offload_backend"]
+        )
+        offload_group.add_argument(
+            "--moe-expert-cache-size", **offload_kwargs["moe_expert_cache_size"]
+        )
+        offload_group.add_argument(
+            "--moe-expert-prefetch-mode",
+            **offload_kwargs["moe_expert_prefetch_mode"],
         )
         offload_group.add_argument("--cpu-offload-gb", **uva_kwargs["cpu_offload_gb"])
         offload_group.add_argument(
@@ -2343,6 +2352,8 @@ class EngineArgs:
 
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,
+            moe_expert_cache_size=self.moe_expert_cache_size,
+            moe_expert_prefetch_mode=self.moe_expert_prefetch_mode,
             uva=UVAOffloadConfig(
                 cpu_offload_gb=self.cpu_offload_gb,
                 cpu_offload_params=self.cpu_offload_params,

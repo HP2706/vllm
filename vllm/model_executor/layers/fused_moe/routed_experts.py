@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -15,6 +16,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
+)
+from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+    CachedExpertWeights,
+    ExpertWeightResult,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
@@ -25,6 +30,8 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
@@ -120,6 +127,44 @@ class RoutedExperts(PluggableLayer):
             self.quant_config,
             self.moe_config,
         )
+        vllm_config = get_current_vllm_config()
+        self.expert_weight_cache_size = (
+            vllm_config.offload_config.moe_expert_cache_size
+        )
+        self.expert_prefetch_mode = (
+            vllm_config.offload_config.moe_expert_prefetch_mode
+        )
+        self.expert_weight_cache: CachedExpertWeights | None = None
+        if self.expert_weight_cache_size > 0:
+            model_config = vllm_config.model_config
+            parallel_config = self.moe_config.moe_parallel_config
+            if not current_platform.is_cuda():
+                raise ValueError("MoE expert caching currently requires CUDA")
+            if model_config is None:
+                raise ValueError("MoE expert caching requires a model configuration")
+            if not model_config.enforce_eager:
+                raise ValueError(
+                    "moe_expert_cache_size currently requires enforce_eager=True"
+                )
+            if (
+                parallel_config.use_ep
+                or parallel_config.tp_size != 1
+                or parallel_config.dp_size != 1
+                or parallel_config.pcp_size != 1
+            ):
+                raise ValueError(
+                    "MoE expert caching currently supports only single-GPU execution"
+                )
+            if quant_config is not None:
+                raise ValueError(
+                    "MoE expert caching currently supports only unquantized weights"
+                )
+            if self.moe_config.has_bias:
+                raise ValueError("MoE expert caching does not yet support expert bias")
+            if self.quant_method.is_monolithic:
+                raise ValueError(
+                    "MoE expert caching requires a modular expert kernel backend"
+                )
 
         # Round up hidden size and update moe_config.
         # TODO: move roundup to _get_quant_method?
@@ -172,6 +217,49 @@ class RoutedExperts(PluggableLayer):
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
         self.lora_base_layer_prefix = ""
+
+    def init_expert_weight_cache(self) -> None:
+        """Move complete expert tensors to CPU and allocate bounded GPU slots."""
+        if self.expert_weight_cache_size == 0:
+            return
+        if self.expert_weight_cache is not None:
+            raise RuntimeError("expert weight cache was initialized twice")
+
+        cache = CachedExpertWeights(
+            capacity=self.expert_weight_cache_size,
+            w13_weight=self.w13_weight.data,
+            w2_weight=self.w2_weight.data,
+        )
+        self.expert_weight_cache = cache
+        replace_parameter(
+            self,
+            "w13_weight",
+            torch.empty(0, dtype=self.params_dtype, device=cache.device),
+        )
+        replace_parameter(
+            self,
+            "w2_weight",
+            torch.empty(0, dtype=self.params_dtype, device=cache.device),
+        )
+        logger.info(
+            "Enabled expert cache for %s: %d/%d GPU slots, %.3f GiB GPU, "
+            "%.3f GiB pinned CPU",
+            self.layer_name,
+            cache.capacity,
+            cache.num_experts,
+            cache.gpu_bytes / 1024**3,
+            cache.cpu_bytes / 1024**3,
+        )
+
+    def prepare_expert_weights(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
+        """Resolve router IDs to resident tensors and cache-local IDs."""
+        if self.expert_weight_cache is None:
+            return ExpertWeightResult(
+                w13_weight=self.w13_weight,
+                w2_weight=self.w2_weight,
+                topk_ids=topk_ids,
+            )
+        return self.expert_weight_cache.prepare(topk_ids)
 
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
@@ -1223,6 +1311,33 @@ class RoutedExperts(PluggableLayer):
         **kwargs,
     ) -> torch.Tensor:
         raise AssertionError("Call forward_modular or forward_monolithic instead.")
+
+
+def link_expert_weight_caches(model: torch.nn.Module) -> None:
+    """Link cached routed-expert layers for cross-layer prefetch."""
+    cached_layers = [
+        module
+        for module in model.modules()
+        if isinstance(module, RoutedExperts)
+        and module.expert_weight_cache is not None
+    ]
+    caches: list[CachedExpertWeights] = []
+    for layer in cached_layers:
+        cache = layer.expert_weight_cache
+        assert cache is not None
+        cache.set_next_cache(None)
+        caches.append(cache)
+    linked_layers = 0
+    for layer_index, current_layer in enumerate(cached_layers[:-1]):
+        if current_layer.expert_prefetch_mode == "same_id_next_layer":
+            caches[layer_index].set_next_cache(caches[layer_index + 1])
+            linked_layers += 1
+    if cached_layers:
+        logger.info(
+            "Linked %d/%d MoE expert caches for cross-layer speculation",
+            linked_layers,
+            len(cached_layers),
+        )
 
 
 # Mark the RoutedExperts weight_loader as supporting MoE-specific parameters
