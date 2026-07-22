@@ -356,6 +356,11 @@ class CachedExpertWeights:
             for expert_id in expert_ids
         ]
         misses = [decision for decision in decisions if not decision.hit]
+        demand_wait_ids = tuple(
+            decision.expert_id
+            for decision in decisions
+            if not speculative and (not decision.hit or decision.useful_speculation)
+        )
 
         self.hits += sum(decision.hit and not speculative for decision in decisions)
         self.useful_speculations += sum(
@@ -370,7 +375,7 @@ class CachedExpertWeights:
             self.demand_misses += len(misses)
 
         if not misses:
-            return ()
+            return demand_wait_ids
 
         compute_stream = torch.cuda.current_stream(self.device)
         safe_to_overwrite = torch.cuda.Event(enable_timing=False)
@@ -392,7 +397,7 @@ class CachedExpertWeights:
 
         for decision in misses:
             self.expert_to_slot[decision.expert_id] = decision.slot
-        return tuple(decision.expert_id for decision in misses)
+        return demand_wait_ids
 
     @torch.compiler.disable
     def prefetch(self, predicted_expert_ids: torch.Tensor) -> None:

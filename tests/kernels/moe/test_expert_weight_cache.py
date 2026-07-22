@@ -126,13 +126,25 @@ def test_cached_expert_weights_cold_miss_and_warm_hit() -> None:
 def test_cached_expert_weights_oracle_prefetch_avoids_demand_miss() -> None:
     w13 = torch.randn(8, 32, 16, dtype=torch.bfloat16, device="cuda")
     w2 = torch.randn(8, 16, 16, dtype=torch.bfloat16, device="cuda")
+    expected_w13 = w13[[0, 2, 4, 6]].cpu()
+    expected_w2 = w2[[0, 2, 4, 6]].cpu()
     cache = CachedExpertWeights(capacity=4, w13_weight=w13, w2_weight=w2)
     ids = torch.tensor([[0, 2, 4, 6]], dtype=torch.int32, device="cuda")
+    cache.gpu_w13_weight.zero_()
+    cache.gpu_w2_weight.zero_()
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(cache.copy_stream):
+        torch.cuda._sleep(10_000_000)
 
     cache.prefetch(ids)
     result = cache.prepare(ids)
+    observed_w13 = result.w13_weight[result.topk_ids.long()].clone()
+    observed_w2 = result.w2_weight[result.topk_ids.long()].clone()
     torch.cuda.synchronize()
 
+    torch.testing.assert_close(observed_w13[0].cpu(), expected_w13)
+    torch.testing.assert_close(observed_w2[0].cpu(), expected_w2)
     assert result.topk_ids.min().item() >= 0
     assert result.topk_ids.max().item() < cache.capacity
     metrics = cache.metrics()
