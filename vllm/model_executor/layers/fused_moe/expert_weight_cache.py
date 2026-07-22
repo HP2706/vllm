@@ -295,6 +295,8 @@ class CachedExpertWeights:
         )
         self.next_cache: CachedExpertWeights | None = None
         self.oracle_lookahead_state: OracleLookaheadState | None = None
+        self.route_recording_enabled = False
+        self.recorded_routes: list[tuple[int, ...]] = []
         _ACTIVE_CACHES.add(self)
 
     @staticmethod
@@ -510,6 +512,8 @@ class CachedExpertWeights:
         self.routing_mode = "fallback"
         self.allowed_expert_mask.fill_(True)
         self.oracle_lookahead_state = None
+        self.route_recording_enabled = False
+        self.recorded_routes = []
         self.reset_metrics()
 
     def apply_router_mask(self, router_logits: torch.Tensor) -> torch.Tensor:
@@ -526,6 +530,14 @@ class CachedExpertWeights:
     @torch.compiler.disable
     def prepare(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
         """Ensure exact router-selected experts are ready for kernel use."""
+        if self.route_recording_enabled:
+            if topk_ids.shape[0] != 1:
+                raise RuntimeError(
+                    "route recording supports decode batch size one"
+                )
+            self.recorded_routes.append(
+                tuple(int(expert_id) for expert_id in topk_ids.reshape(-1).tolist())
+            )
         if self.oracle_lookahead_state is not None:
             if self.layer_index is None:
                 raise RuntimeError("oracle lookahead requires a linked layer index")
@@ -620,6 +632,35 @@ def reset_expert_weight_cache_contents() -> None:
     torch.cuda.synchronize(caches[0].device)
     for cache in caches:
         cache.reset_contents()
+
+
+def enable_expert_route_recording() -> None:
+    """Record exact per-token, per-layer decode routes for oracle replay."""
+    caches = _ordered_active_caches()
+    if any(cache.route_recording_enabled for cache in caches):
+        raise RuntimeError("expert route recording is already enabled")
+    for cache in caches:
+        cache.recorded_routes = []
+        cache.route_recording_enabled = True
+
+
+def disable_expert_route_recording(
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Stop route recording and return routes indexed by token then layer."""
+    caches = _ordered_active_caches()
+    if not all(cache.route_recording_enabled for cache in caches):
+        raise RuntimeError("expert route recording is not enabled on every layer")
+    calls_by_layer = tuple(len(cache.recorded_routes) for cache in caches)
+    if len(set(calls_by_layer)) != 1:
+        raise RuntimeError(
+            f"route recording calls differ by layer: {calls_by_layer}"
+        )
+    for cache in caches:
+        cache.route_recording_enabled = False
+    return tuple(
+        tuple(cache.recorded_routes[token_index] for cache in caches)
+        for token_index in range(calls_by_layer[0])
+    )
 
 
 def configure_oracle_expert_lookahead(

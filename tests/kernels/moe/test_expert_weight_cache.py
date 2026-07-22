@@ -9,6 +9,8 @@ import torch
 from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
     CachedExpertWeights,
     LFRUCacheIndex,
+    disable_expert_route_recording,
+    enable_expert_route_recording,
 )
 
 
@@ -138,6 +140,24 @@ def test_cached_expert_weights_oracle_prefetch_avoids_demand_miss() -> None:
     assert metrics["useful_speculations"] == 4
     assert metrics["demand_misses"] == 0
     assert metrics["speculation_precision"] == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cached_expert_weights_records_exact_decode_routes() -> None:
+    w13 = torch.randn(8, 32, 16, dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn(8, 16, 16, dtype=torch.bfloat16, device="cuda")
+    cache = CachedExpertWeights(capacity=4, w13_weight=w13, w2_weight=w2)
+    cache.set_layer_index(0)
+    first_ids = torch.tensor([[6, 1, 4, 2]], dtype=torch.int32, device="cuda")
+    second_ids = torch.tensor([[3, 7, 0, 5]], dtype=torch.int32, device="cuda")
+
+    enable_expert_route_recording()
+    cache.prepare(first_ids)
+    cache.prepare(second_ids)
+    routes = disable_expert_route_recording()
+    torch.cuda.synchronize()
+
+    assert routes == (((6, 1, 4, 2),), ((3, 7, 0, 5),))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
