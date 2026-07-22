@@ -5,8 +5,8 @@ import itertools
 import warnings
 from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Optional, Union,
-                    cast, overload)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Literal, Optional,
+                    Union, cast, overload)
 
 import cloudpickle
 import torch.nn as nn
@@ -53,6 +53,8 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, Device, deprecate_kwargs, is_list_of
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+        ExpertResidencyIntent, ResidencyTicket)
     from vllm.v1.metrics.reader import Metric
 
 logger = init_logger(__name__)
@@ -619,6 +621,94 @@ class LLM:
         """
         executor = self.llm_engine.model_executor
         return executor.apply_model(func)
+
+    def enable_expert_weight_cache(self, capacity: int) -> int:
+        """Compact full MoE weights into bounded caches while the engine is idle."""
+        from vllm.model_executor.layers.fused_moe.layer import (
+            initialize_expert_weight_caches)
+
+        def initialize(model: nn.Module) -> int:
+            return initialize_expert_weight_caches(model, capacity)
+
+        layer_counts = self.apply_model(initialize)
+        if len(layer_counts) != 1:
+            raise RuntimeError(
+                "runtime expert-cache compaction requires one model worker"
+            )
+        return layer_counts[0]
+
+    def replace_expert_residency_group(
+        self,
+        intents: tuple["ExpertResidencyIntent", ...],
+        *,
+        routing_mode: Literal["fallback", "restricted"] = "fallback",
+    ) -> "ResidencyTicket":
+        """Install one blocking, model-wide expert residency group."""
+        from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+            replace_expert_residency_group)
+
+        def replace_group(model: nn.Module) -> "ResidencyTicket":
+            del model
+            return replace_expert_residency_group(
+                intents,
+                routing_mode=routing_mode,
+            )
+
+        tickets = self.apply_model(replace_group)
+        if len(tickets) != 1:
+            raise RuntimeError("expert residency groups require one model worker")
+        return tickets[0]
+
+    def stage_expert_residency_group(
+        self,
+        intents: tuple["ExpertResidencyIntent", ...],
+        *,
+        routing_mode: Literal["fallback", "restricted"] = "fallback",
+    ) -> "ResidencyTicket":
+        """Begin staging a model-wide plan and return its activation ticket."""
+        from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+            stage_expert_residency_group)
+
+        def stage_group(model: nn.Module) -> "ResidencyTicket":
+            del model
+            return stage_expert_residency_group(
+                intents,
+                routing_mode=routing_mode,
+            )
+
+        tickets = self.apply_model(stage_group)
+        if len(tickets) != 1:
+            raise RuntimeError("expert residency groups require one model worker")
+        return tickets[0]
+
+    def activate_expert_residency_group(
+        self,
+        ticket: "ResidencyTicket",
+    ) -> None:
+        """Wait for a staged expert plan and publish it atomically."""
+        from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+            activate_expert_residency_group)
+
+        def activate_group(model: nn.Module) -> None:
+            del model
+            activate_expert_residency_group(ticket)
+
+        results = self.apply_model(activate_group)
+        if len(results) != 1:
+            raise RuntimeError("expert residency groups require one model worker")
+
+    def cancel_expert_residency_group(self, group_id: str) -> None:
+        """Release retention and restore unrestricted routing."""
+        from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+            cancel_expert_residency_group)
+
+        def cancel_group(model: nn.Module) -> None:
+            del model
+            cancel_expert_residency_group(group_id)
+
+        results = self.apply_model(cancel_group)
+        if len(results) != 1:
+            raise RuntimeError("expert residency groups require one model worker")
 
     def _get_beam_search_lora_requests(
         self,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 from abc import abstractmethod
 from collections.abc import Iterable
 from enum import Enum
@@ -26,10 +27,14 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEActivationFormat, FusedMoEModularKernel,
     FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize)
+from vllm.model_executor.layers.fused_moe.expert_weight_cache import (
+    CachedExpertWeights, ExpertWeightResult)
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     is_rocm_aiter_moe_enabled)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
+from vllm.model_executor.layers.quantization.utils.layer_utils import (
+    replace_parameter)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
@@ -422,6 +427,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
+        assert isinstance(layer, FusedMoE)
+        router_logits = layer.apply_expert_residency_mask(router_logits)
+
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -440,23 +448,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count)
 
+        expert_weights = layer.prepare_expert_weights(topk_ids)
         if self.rocm_aiter_moe_enabled:
             return self.rocm_aiter_fused_experts(
                 hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
+                w1=expert_weights.w13_weight,
+                w2=expert_weights.w2_weight,
                 topk_weights=topk_weights,
-                topk_ids=topk_ids,
+                topk_ids=expert_weights.topk_ids,
                 expert_map=expert_map,
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input)
         else:
             return self.fused_experts(
                 hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
+                w1=expert_weights.w13_weight,
+                w2=expert_weights.w2_weight,
                 topk_weights=topk_weights,
-                topk_ids=topk_ids,
+                topk_ids=expert_weights.topk_ids,
                 inplace=True,
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
@@ -773,6 +782,7 @@ class FusedMoE(torch.nn.Module):
         self.quant_method.create_weights(layer=self, **moe_quant_params)
         if isinstance(self.quant_method, FusedMoEMethodBase):
             self.quant_method.maybe_swap_experts_impl(self.moe_parallel_config)
+        self.expert_weight_cache: Optional[CachedExpertWeights] = None
 
         # Chunked all2all staging tensor
         self.batched_hidden_states: Optional[torch.Tensor] = None
@@ -1568,6 +1578,93 @@ class FusedMoE(torch.nn.Module):
         s += f", scoring_func='{self.scoring_func}', activation='{self.activation}'"  # noqa: E501
 
         return s
+
+    def init_expert_weight_cache(self, capacity: int) -> None:
+        """Move full expert tensors to pinned CPU memory and bounded GPU slots."""
+        if self.expert_weight_cache is not None:
+            raise RuntimeError("expert weight cache was initialized twice")
+        if not current_platform.is_cuda():
+            raise ValueError("MoE expert caching currently requires CUDA")
+        if self.use_ep or self.tp_size != 1 or self.dp_size != 1:
+            raise ValueError(
+                "MoE expert caching currently supports single-GPU execution"
+            )
+        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            raise NotImplementedError(
+                "MoE expert caching currently supports unquantized weights"
+            )
+        cache = CachedExpertWeights(
+            capacity=capacity,
+            w13_weight=self.w13_weight.data,
+            w2_weight=self.w2_weight.data,
+            experts_per_token=self.top_k,
+        )
+        self.expert_weight_cache = cache
+        replace_parameter(
+            self,
+            "w13_weight",
+            torch.empty(0, dtype=self.params_dtype, device=cache.device),
+        )
+        replace_parameter(
+            self,
+            "w2_weight",
+            torch.empty(0, dtype=self.params_dtype, device=cache.device),
+        )
+
+    def prepare_expert_weights(
+        self,
+        topk_ids: torch.Tensor,
+    ) -> ExpertWeightResult:
+        """Resolve logical router IDs to cache-local expert IDs and weights."""
+        if self.expert_weight_cache is None:
+            return ExpertWeightResult(
+                w13_weight=self.w13_weight,
+                w2_weight=self.w2_weight,
+                topk_ids=topk_ids,
+            )
+        return self.expert_weight_cache.prepare(topk_ids)
+
+    def apply_expert_residency_mask(
+        self,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply a restricted residency plan before top-k routing."""
+        if self.expert_weight_cache is None:
+            return router_logits
+        return self.expert_weight_cache.apply_router_mask(router_logits)
+
+
+def link_expert_weight_caches(model: torch.nn.Module) -> int:
+    """Assign model-order indices to all initialized MoE expert caches."""
+    caches = [
+        module.expert_weight_cache
+        for module in model.modules()
+        if isinstance(module, FusedMoE)
+        and module.expert_weight_cache is not None
+    ]
+    for layer_index, cache in enumerate(caches):
+        assert cache is not None
+        cache.set_layer_index(layer_index)
+        cache.set_next_cache(None)
+    return len(caches)
+
+
+def initialize_expert_weight_caches(
+    model: torch.nn.Module,
+    capacity: int,
+) -> int:
+    """Compact fully resident MoE layers into bounded expert caches."""
+    if capacity <= 0:
+        raise ValueError(f"capacity must be positive, got {capacity}")
+    layers = [module for module in model.modules() if isinstance(module, FusedMoE)]
+    if not layers:
+        raise RuntimeError("model has no fused MoE layers")
+    for layer in layers:
+        layer.init_expert_weight_cache(capacity)
+    linked_layers = link_expert_weight_caches(model)
+    gc.collect()
+    torch.cuda.empty_cache()
+    return linked_layers
 
 
 def moe_forward(hidden_states: torch.Tensor, router_logits: torch.Tensor,
