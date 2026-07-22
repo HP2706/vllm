@@ -338,7 +338,12 @@ class CachedExpertWeights:
             )
         return unique_ids
 
-    def _schedule(self, expert_ids: tuple[int, ...], *, speculative: bool) -> None:
+    def _schedule(
+        self,
+        expert_ids: tuple[int, ...],
+        *,
+        speculative: bool,
+    ) -> tuple[int, ...]:
         protected_expert_ids = frozenset(expert_ids)
         decisions = [
             self.index.resolve(
@@ -363,7 +368,7 @@ class CachedExpertWeights:
             self.demand_misses += len(misses)
 
         if not misses:
-            return
+            return ()
 
         compute_stream = torch.cuda.current_stream(self.device)
         safe_to_overwrite = torch.cuda.Event(enable_timing=False)
@@ -385,6 +390,7 @@ class CachedExpertWeights:
 
         for decision in misses:
             self.expert_to_slot[decision.expert_id] = decision.slot
+        return tuple(decision.expert_id for decision in misses)
 
     @torch.compiler.disable
     def prefetch(self, predicted_expert_ids: torch.Tensor) -> None:
@@ -528,10 +534,23 @@ class CachedExpertWeights:
                     "oracle lookahead benchmark supports decode batch size one"
                 )
             self.oracle_lookahead_state.prefetch_from(self.layer_index)
-        expert_ids = self._validate_ids(topk_ids.unique().tolist())
-        self._schedule(expert_ids, speculative=False)
+        plan_covers_routes = self.active_group_id is not None and (
+            self.routing_mode == "restricted"
+            or len(self.index.retained_expert_ids) == self.num_experts
+        )
+        if plan_covers_routes and self.next_cache is None:
+            self.hits += topk_ids.numel()
+            return ExpertWeightResult(
+                w13_weight=self.gpu_w13_weight,
+                w2_weight=self.gpu_w2_weight,
+                topk_ids=self.expert_to_slot[topk_ids.long()].to(topk_ids.dtype),
+            )
 
-        self.wait_for_experts(expert_ids)
+        logical_ids = topk_ids.reshape(-1).tolist()
+        expert_ids = self._validate_ids(tuple(dict.fromkeys(logical_ids)))
+        missed_expert_ids = self._schedule(expert_ids, speculative=False)
+
+        self.wait_for_experts(missed_expert_ids)
 
         remapped_ids = self.expert_to_slot[topk_ids.long()].to(topk_ids.dtype)
         if self.next_cache is not None:

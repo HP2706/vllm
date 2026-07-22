@@ -170,5 +170,14 @@ def test_cached_expert_weights_activates_restricted_residency_group() -> None:
         for expert_id in expert_ids
     )
 
+    routed_ids = torch.tensor([[1, 5]], dtype=torch.int32, device="cuda")
+    result = cache.prepare(routed_ids)
+    torch.cuda.synchronize()
+    assert torch.equal(
+        result.topk_ids,
+        cache.expert_to_slot[routed_ids.long()].to(routed_ids.dtype),
+    )
+    assert cache.metrics()["hits"] == routed_ids.numel()
+
     cache.cancel_residency_group("turn-1")
     assert torch.equal(cache.apply_router_mask(logits), logits)
