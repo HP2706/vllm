@@ -384,8 +384,6 @@ class CachedExpertWeights:
 
         with torch.cuda.stream(self.copy_stream):
             for decision in misses:
-                if decision.evicted_expert_id is not None:
-                    self.expert_to_slot[decision.evicted_expert_id] = -1
                 self.gpu_w13_weight[decision.slot].copy_(
                     self.cpu_w13_weight[decision.expert_id], non_blocking=True
                 )
@@ -395,9 +393,21 @@ class CachedExpertWeights:
                 self.slot_ready_events[decision.slot].record(self.copy_stream)
                 self.bytes_copied += self.bytes_per_expert
 
-        for decision in misses:
-            self.expert_to_slot[decision.expert_id] = decision.slot
         return demand_wait_ids
+
+    def _remap_dynamic_ids(
+        self,
+        topk_ids: torch.Tensor,
+        logical_ids: tuple[int, ...],
+    ) -> torch.Tensor:
+        slot_ids = tuple(
+            self.index.entries[expert_id].slot for expert_id in logical_ids
+        )
+        return torch.tensor(
+            slot_ids,
+            dtype=topk_ids.dtype,
+            device=self.device,
+        ).reshape(topk_ids.shape)
 
     @torch.compiler.disable
     def prefetch(self, predicted_expert_ids: torch.Tensor) -> None:
@@ -486,6 +496,18 @@ class CachedExpertWeights:
         self.index.set_retained_experts(expert_ids)
         for expert_id in expert_ids:
             self.index.entries[expert_id].speculative = False
+        self.expert_to_slot.fill_(-1)
+        logical_indices = torch.tensor(
+            expert_ids,
+            dtype=torch.long,
+            device=self.device,
+        )
+        physical_slots = torch.tensor(
+            tuple(self.index.entries[expert_id].slot for expert_id in expert_ids),
+            dtype=self.expert_to_slot.dtype,
+            device=self.device,
+        )
+        self.expert_to_slot[logical_indices] = physical_slots
         self.allowed_expert_mask.fill_(routing_mode == "fallback")
         if routing_mode == "restricted":
             indices = torch.tensor(expert_ids, dtype=torch.long, device=self.device)
@@ -563,13 +585,15 @@ class CachedExpertWeights:
                 topk_ids=self.expert_to_slot[topk_ids.long()].to(topk_ids.dtype),
             )
 
-        logical_ids = topk_ids.reshape(-1).tolist()
+        logical_ids = tuple(
+            int(expert_id) for expert_id in topk_ids.reshape(-1).tolist()
+        )
         expert_ids = self._validate_ids(tuple(dict.fromkeys(logical_ids)))
         missed_expert_ids = self._schedule(expert_ids, speculative=False)
 
         self.wait_for_experts(missed_expert_ids)
 
-        remapped_ids = self.expert_to_slot[topk_ids.long()].to(topk_ids.dtype)
+        remapped_ids = self._remap_dynamic_ids(topk_ids, logical_ids)
         if self.next_cache is not None:
             self.next_cache.prefetch_expert_ids(expert_ids)
         return ExpertWeightResult(
