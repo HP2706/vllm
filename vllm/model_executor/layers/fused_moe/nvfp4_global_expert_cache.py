@@ -37,6 +37,8 @@ EXPERT_PARAMETER_NAMES = (
     "w2_weight_scale",
     "w13_weight_scale_2",
     "w2_weight_scale_2",
+    "w13_input_scale",
+    "w2_input_scale",
 )
 
 
@@ -86,6 +88,8 @@ class GlobalNVFP4ExpertCache:
                 "w2_weight_scale": layer.w2_weight_scale,
                 "w13_weight_scale_2": layer.w13_weight_scale_2,
                 "w2_weight_scale_2": layer.w2_weight_scale_2,
+                "w13_input_scale": layer.w13_input_scale,
+                "w2_input_scale": layer.w2_input_scale,
             }
             for layer in layers
         )
@@ -173,6 +177,8 @@ class GlobalNVFP4ExpertCache:
                 layer.w2_weight_scale,
                 layer.w13_weight_scale_2,
                 layer.w2_weight_scale_2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
             )
             for parameter in parameters:
                 if parameter._vllm_is_uva_offloaded:
@@ -506,6 +512,8 @@ class GlobalNVFP4ExpertCache:
             w2_scale=self.buffers["w2_weight_scale"],
             w13_scale_2=self.buffers["w13_weight_scale_2"],
             w2_scale_2=self.buffers["w2_weight_scale_2"],
+            w13_input_scale=self.buffers["w13_input_scale"],
+            w2_input_scale=self.buffers["w2_input_scale"],
             global_num_experts=self.capacity,
         )
 

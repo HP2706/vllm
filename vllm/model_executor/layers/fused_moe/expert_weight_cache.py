@@ -93,6 +93,8 @@ class ExpertWeightResult:
     w2_scale: torch.Tensor | None = None
     w13_scale_2: torch.Tensor | None = None
     w2_scale_2: torch.Tensor | None = None
+    w13_input_scale: torch.Tensor | None = None
+    w2_input_scale: torch.Tensor | None = None
     global_num_experts: int | None = None
 
 

@@ -1673,6 +1673,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             expert_weights.w2_scale,
             expert_weights.w13_scale_2,
             expert_weights.w2_scale_2,
+            expert_weights.w13_input_scale,
+            expert_weights.w2_input_scale,
         )
         if any(value is not None for value in scale_values):
             if any(value is None for value in scale_values):
@@ -1683,6 +1685,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             quant_config._w2.scale = expert_weights.w2_scale
             quant_config._w1.alpha_or_gscale = expert_weights.w13_scale_2
             quant_config._w2.alpha_or_gscale = expert_weights.w2_scale_2
+            quant_config._a1.alpha_or_gscale = 1.0 / expert_weights.w13_input_scale
+            quant_config._a2.alpha_or_gscale = 1.0 / expert_weights.w2_input_scale
         global_num_experts = (
             layer.global_num_experts
             if expert_weights.global_num_experts is None
