@@ -129,12 +129,19 @@ class RoutedExperts(PluggableLayer):
             self.moe_config,
         )
         vllm_config = get_current_vllm_config()
-        self.expert_weight_cache_size = (
-            vllm_config.offload_config.moe_expert_cache_size
+        self.expert_weight_cache_size = vllm_config.offload_config.moe_expert_cache_size
+        self.expert_prefetch_mode = vllm_config.offload_config.moe_expert_prefetch_mode
+        self.global_expert_cache_size = (
+            vllm_config.offload_config.moe_expert_global_cache_size
         )
-        self.expert_prefetch_mode = (
-            vllm_config.offload_config.moe_expert_prefetch_mode
+        self.expert_predictor_checkpoint = (
+            vllm_config.offload_config.moe_expert_predictor_checkpoint
         )
+        self.expert_predictor_history_tokens = (
+            vllm_config.offload_config.moe_expert_predictor_history_tokens
+        )
+        self.expert_metrics_path = vllm_config.offload_config.moe_expert_metrics_path
+        self.global_expert_cache_layer_index: int | None = None
         self.expert_weight_cache: CachedExpertWeights | None = None
         if self.expert_weight_cache_size > 0:
             model_config = vllm_config.model_config
@@ -255,6 +262,17 @@ class RoutedExperts(PluggableLayer):
 
     def prepare_expert_weights(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
         """Resolve router IDs to resident tensors and cache-local IDs."""
+        if self.global_expert_cache_size > 0:
+            if self.global_expert_cache_layer_index is None:
+                raise RuntimeError("global expert-cache layer index is unset")
+            from vllm.model_executor.layers.fused_moe.nvfp4_global_expert_cache import (
+                prepare_global_nvfp4_expert_weights,
+            )
+
+            return prepare_global_nvfp4_expert_weights(
+                self.global_expert_cache_layer_index,
+                topk_ids,
+            )
         if self.expert_weight_cache is None:
             return ExpertWeightResult(
                 w13_weight=self.w13_weight,
@@ -263,9 +281,19 @@ class RoutedExperts(PluggableLayer):
             )
         return self.expert_weight_cache.prepare(topk_ids)
 
-    def apply_expert_residency_mask(
-        self, router_logits: torch.Tensor
-    ) -> torch.Tensor:
+    def finish_expert_weights(self) -> None:
+        """Advance a model-wide prediction schedule after this MoE kernel."""
+        if self.global_expert_cache_size == 0:
+            return
+        if self.global_expert_cache_layer_index is None:
+            raise RuntimeError("global expert-cache layer index is unset")
+        from vllm.model_executor.layers.fused_moe.nvfp4_global_expert_cache import (
+            finish_global_nvfp4_expert_layer,
+        )
+
+        finish_global_nvfp4_expert_layer(self.global_expert_cache_layer_index)
+
+    def apply_expert_residency_mask(self, router_logits: torch.Tensor) -> torch.Tensor:
         """Apply an activated restricted plan before modular top-k routing."""
         if self.expert_weight_cache is None:
             return router_logits
@@ -1328,8 +1356,7 @@ def link_expert_weight_caches(model: torch.nn.Module) -> None:
     cached_layers = [
         module
         for module in model.modules()
-        if isinstance(module, RoutedExperts)
-        and module.expert_weight_cache is not None
+        if isinstance(module, RoutedExperts) and module.expert_weight_cache is not None
     ]
     caches: list[CachedExpertWeights] = []
     for layer_index, layer in enumerate(cached_layers):
@@ -1350,6 +1377,35 @@ def link_expert_weight_caches(model: torch.nn.Module) -> None:
             len(cached_layers),
         )
 
+    global_cached_layers = [
+        module
+        for module in model.modules()
+        if isinstance(module, RoutedExperts) and module.global_expert_cache_size > 0
+    ]
+    if global_cached_layers:
+        global_capacity = global_cached_layers[0].global_expert_cache_size
+        predictor_checkpoint = global_cached_layers[0].expert_predictor_checkpoint
+        history_tokens = global_cached_layers[0].expert_predictor_history_tokens
+        metrics_path = global_cached_layers[0].expert_metrics_path
+        if any(
+            layer.global_expert_cache_size != global_capacity
+            for layer in global_cached_layers
+        ):
+            raise RuntimeError("global expert-cache capacities differ by layer")
+        for layer_index, layer in enumerate(global_cached_layers):
+            layer.global_expert_cache_layer_index = layer_index
+        from vllm.model_executor.layers.fused_moe.nvfp4_global_expert_cache import (
+            initialize_global_nvfp4_expert_cache,
+        )
+
+        initialize_global_nvfp4_expert_cache(
+            tuple(global_cached_layers),
+            capacity=global_capacity,
+            predictor_checkpoint=predictor_checkpoint,
+            history_tokens=history_tokens,
+            metrics_path=metrics_path,
+        )
+
 
 def initialize_expert_weight_caches(
     model: torch.nn.Module,
@@ -1364,9 +1420,7 @@ def initialize_expert_weight_caches(
     """
     if capacity <= 0:
         raise ValueError(f"capacity must be positive, got {capacity}")
-    layers = [
-        module for module in model.modules() if isinstance(module, RoutedExperts)
-    ]
+    layers = [module for module in model.modules() if isinstance(module, RoutedExperts)]
     if not layers:
         raise RuntimeError("model has no routed-expert layers")
     for layer in layers:

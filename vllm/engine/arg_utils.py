@@ -205,9 +205,9 @@ def collection_to_kwargs(type_hints: set[TypeHint], type: TypeHint) -> dict[str,
     elem_type = types[0]
 
     # Handle Ellipsis
-    assert all(t is elem_type for t in types if t is not Ellipsis), (
-        f"All non-Ellipsis elements must be of the same type. Got {types}."
-    )
+    assert all(
+        t is elem_type for t in types if t is not Ellipsis
+    ), f"All non-Ellipsis elements must be of the same type. Got {types}."
 
     # Handle Union types
     if get_origin(elem_type) in {Union, UnionType}:
@@ -519,6 +519,12 @@ class EngineArgs:
     offload_backend: str = OffloadConfig.offload_backend
     moe_expert_cache_size: int = OffloadConfig.moe_expert_cache_size
     moe_expert_prefetch_mode: str = OffloadConfig.moe_expert_prefetch_mode
+    moe_expert_global_cache_size: int = OffloadConfig.moe_expert_global_cache_size
+    moe_expert_predictor_checkpoint: str = OffloadConfig.moe_expert_predictor_checkpoint
+    moe_expert_predictor_history_tokens: int = (
+        OffloadConfig.moe_expert_predictor_history_tokens
+    )
+    moe_expert_metrics_path: str = OffloadConfig.moe_expert_metrics_path
     cpu_offload_gb: float = UVAOffloadConfig.cpu_offload_gb
     cpu_offload_params: set[str] = get_field(UVAOffloadConfig, "cpu_offload_params")
     offload_group_size: int = PrefetchOffloadConfig.offload_group_size
@@ -1228,6 +1234,22 @@ class EngineArgs:
             "--moe-expert-prefetch-mode",
             **offload_kwargs["moe_expert_prefetch_mode"],
         )
+        offload_group.add_argument(
+            "--moe-expert-global-cache-size",
+            **offload_kwargs["moe_expert_global_cache_size"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-predictor-checkpoint",
+            **offload_kwargs["moe_expert_predictor_checkpoint"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-predictor-history-tokens",
+            **offload_kwargs["moe_expert_predictor_history_tokens"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-metrics-path",
+            **offload_kwargs["moe_expert_metrics_path"],
+        )
         offload_group.add_argument("--cpu-offload-gb", **uva_kwargs["cpu_offload_gb"])
         offload_group.add_argument(
             "--cpu-offload-params", **uva_kwargs["cpu_offload_params"]
@@ -1897,9 +1919,9 @@ class EngineArgs:
             self.kv_cache_dtype, model_config
         )
 
-        assert self.enable_prefix_caching is not None, (
-            "enable_prefix_caching must be set by this point"
-        )
+        assert (
+            self.enable_prefix_caching is not None
+        ), "enable_prefix_caching must be set by this point"
 
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
@@ -1961,15 +1983,15 @@ class EngineArgs:
             # but we should not do this here.
             placement_group = ray.util.get_current_placement_group()
 
-        assert not headless or not self.data_parallel_hybrid_lb, (
-            "data_parallel_hybrid_lb is not applicable in headless mode"
-        )
-        assert not (self.data_parallel_hybrid_lb and self.data_parallel_external_lb), (
-            "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
-        )
-        assert self.data_parallel_backend == "mp" or self.nnodes == 1, (
-            "nnodes > 1 is only supported with data_parallel_backend=mp"
-        )
+        assert (
+            not headless or not self.data_parallel_hybrid_lb
+        ), "data_parallel_hybrid_lb is not applicable in headless mode"
+        assert not (
+            self.data_parallel_hybrid_lb and self.data_parallel_external_lb
+        ), "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
+        assert (
+            self.data_parallel_backend == "mp" or self.nnodes == 1
+        ), "nnodes > 1 is only supported with data_parallel_backend=mp"
         inferred_data_parallel_rank = 0
         if self.nnodes > 1:
             world_size = (
@@ -1981,12 +2003,12 @@ class EngineArgs:
                 self.pipeline_parallel_size * self.tensor_parallel_size
             )
             local_world_size = world_size // self.nnodes
-            assert world_size % self.nnodes == 0, (
-                f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
-            )
-            assert self.node_rank < self.nnodes, (
-                f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
-            )
+            assert (
+                world_size % self.nnodes == 0
+            ), f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
+            assert (
+                self.node_rank < self.nnodes
+            ), f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
             inferred_data_parallel_rank = (
                 self.node_rank * local_world_size
             ) // world_size_within_dp
@@ -2059,9 +2081,9 @@ class EngineArgs:
                     self.node_rank,
                 )
         else:
-            assert not self.data_parallel_hybrid_lb, (
-                "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
-            )
+            assert (
+                not self.data_parallel_hybrid_lb
+            ), "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
 
             if self.data_parallel_backend == "ray" and (
                 envs.VLLM_RAY_DP_PACK_STRATEGY == "span"
@@ -2168,16 +2190,16 @@ class EngineArgs:
             parallel_config,
         )
 
-        assert self.max_num_batched_tokens is not None, (
-            "max_num_batched_tokens must be set by this point"
-        )
+        assert (
+            self.max_num_batched_tokens is not None
+        ), "max_num_batched_tokens must be set by this point"
         assert self.max_num_seqs is not None, "max_num_seqs must be set by this point"
-        assert self.enable_chunked_prefill is not None, (
-            "enable_chunked_prefill must be set by this point"
-        )
-        assert model_config.max_model_len is not None, (
-            "max_model_len must be set by this point"
-        )
+        assert (
+            self.enable_chunked_prefill is not None
+        ), "enable_chunked_prefill must be set by this point"
+        assert (
+            model_config.max_model_len is not None
+        ), "max_model_len must be set by this point"
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -2354,6 +2376,12 @@ class EngineArgs:
             offload_backend=self.offload_backend,
             moe_expert_cache_size=self.moe_expert_cache_size,
             moe_expert_prefetch_mode=self.moe_expert_prefetch_mode,
+            moe_expert_global_cache_size=self.moe_expert_global_cache_size,
+            moe_expert_predictor_checkpoint=self.moe_expert_predictor_checkpoint,
+            moe_expert_predictor_history_tokens=(
+                self.moe_expert_predictor_history_tokens
+            ),
+            moe_expert_metrics_path=self.moe_expert_metrics_path,
             uva=UVAOffloadConfig(
                 cpu_offload_gb=self.cpu_offload_gb,
                 cpu_offload_params=self.cpu_offload_params,
@@ -2657,9 +2685,9 @@ class EngineArgs:
                 self.max_num_seqs *= 2
 
         if orig_max_num_batched_tokens is None:
-            assert model_config.max_model_len is not None, (
-                "max_model_len must be set by this point"
-            )
+            assert (
+                model_config.max_model_len is not None
+            ), "max_model_len must be set by this point"
             if not self.enable_chunked_prefill:
                 # If max_model_len is too short, use the default for higher throughput.
                 self.max_num_batched_tokens = max(

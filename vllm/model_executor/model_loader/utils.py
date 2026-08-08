@@ -147,6 +147,12 @@ def process_weights_after_loading(
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
 
+    from vllm.model_executor.layers.fused_moe.routed_experts import (
+        link_expert_weight_caches,
+    )
+
+    link_expert_weight_caches(model)
+
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -156,15 +162,19 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     original_device_states: dict[str, torch.device] = {}
-    uva_offloaded_parameters: list[str] = []
+    uva_offloaded_parameters: dict[str, nn.Parameter] = {}
+    from vllm.model_executor.offloader.uva import (
+        is_uva_offloaded_parameter,
+        replace_uva_offloaded_parameter,
+    )
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
-        if getattr(p, "_vllm_is_uva_offloaded", False):
-            uva_offloaded_parameters.append(name)
+        if is_uva_offloaded_parameter(p):
+            uva_offloaded_parameters[name] = p
         # Parameters already on target device are not touched
 
     try:
@@ -181,16 +191,18 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
                 original_device: torch.device = original_device_states[name]
                 p.data = p.data.to(original_device)
 
-            # parameter is UVA offloaded, but was replaced with a new device tensor
-            # re-offload it to CPU using UVA
-            if name in uva_offloaded_parameters and not getattr(
-                p, "_vllm_is_uva_offloaded", False
-            ):
+            # A UVA parameter replaced during quantization must be re-offloaded.
+            # Stamp every post-processed Parameter so later code can use the
+            # marker as an explicit contract rather than feature detection.
+            original_uva_parameter = uva_offloaded_parameters.get(name)
+            is_uva_offloaded = original_uva_parameter is not None
+            if is_uva_offloaded and p is not original_uva_parameter:
                 cpu_data = p.data.to(device="cpu")
                 if use_pin_memory:
                     cpu_data = cpu_data.pin_memory()
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
-                p._vllm_is_uva_offloaded = True
+                replace_uva_offloaded_parameter(original_uva_parameter, p)
+            p._vllm_is_uva_offloaded = is_uva_offloaded
 
 
 _MODEL_ARCH_BY_HASH = dict[int, tuple[type[nn.Module], str]]()

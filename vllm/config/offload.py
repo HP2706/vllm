@@ -109,12 +109,41 @@ class OffloadConfig:
     H2D copies with intervening GPU work.
     """
 
+    moe_expert_global_cache_size: int = Field(default=0, ge=0)
+    """Model-wide layer-expert slots for the experimental NVFP4 cache.
+
+    Unlike ``moe_expert_cache_size``, these slots are shared across all MoE
+    layers. This permits capacity fractions below one routed top-k per layer
+    while preserving native routing through synchronous demand fallback.
+    """
+
+    moe_expert_predictor_checkpoint: str = ""
+    """Checkpoint for the trained route-history cache predictor."""
+
+    moe_expert_predictor_history_tokens: int = Field(default=512, ge=1)
+    """Maximum routed-token history supplied to the cache predictor."""
+
+    moe_expert_metrics_path: str = ""
+    """Optional JSON path updated with live cache and predictor metrics."""
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
         if self.moe_expert_prefetch_mode != "none" and self.moe_expert_cache_size == 0:
             raise ValueError(
                 "moe_expert_prefetch_mode requires moe_expert_cache_size > 0"
+            )
+        if (
+            self.moe_expert_global_cache_size > 0
+            and not self.moe_expert_predictor_checkpoint
+        ):
+            raise ValueError(
+                "moe_expert_global_cache_size requires "
+                "moe_expert_predictor_checkpoint"
+            )
+        if self.moe_expert_global_cache_size > 0 and self.moe_expert_cache_size > 0:
+            raise ValueError(
+                "per-layer and model-wide MoE expert caches cannot be enabled together"
             )
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:

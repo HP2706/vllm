@@ -71,9 +71,7 @@ class OracleLookaheadState:
         if self.lookahead_layers == 0:
             return
         target_position = (
-            token_index * len(self.caches)
-            + layer_index
-            + self.lookahead_layers
+            token_index * len(self.caches) + layer_index + self.lookahead_layers
         )
         target_token = target_position // len(self.caches)
         target_layer = target_position % len(self.caches)
@@ -91,6 +89,11 @@ class ExpertWeightResult:
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
     topk_ids: torch.Tensor
+    w13_scale: torch.Tensor | None = None
+    w2_scale: torch.Tensor | None = None
+    w13_scale_2: torch.Tensor | None = None
+    w2_scale_2: torch.Tensor | None = None
+    global_num_experts: int | None = None
 
 
 @dataclass
@@ -174,9 +177,7 @@ class LFRUCacheIndex:
         else:
             evicted_expert_id = self._victim(protected_expert_ids)
             slot = self.entries.pop(evicted_expert_id).slot
-            self.retained_expert_ids = (
-                self.retained_expert_ids - {evicted_expert_id}
-            )
+            self.retained_expert_ids = self.retained_expert_ids - {evicted_expert_id}
 
         self.entries[expert_id] = CacheEntry(
             slot=slot,
@@ -778,9 +779,7 @@ def aggregate_expert_cache_metrics() -> dict[str, int | float]:
     hits = sum(int(item["hits"]) for item in metrics)
     demand_misses = sum(int(item["demand_misses"]) for item in metrics)
     speculative_loads = sum(int(item["speculative_loads"]) for item in metrics)
-    skipped_speculations = sum(
-        int(item["skipped_speculations"]) for item in metrics
-    )
+    skipped_speculations = sum(int(item["skipped_speculations"]) for item in metrics)
     useful_speculations = sum(int(item["useful_speculations"]) for item in metrics)
     demand_accesses = hits + demand_misses
     return {
@@ -800,9 +799,7 @@ def aggregate_expert_cache_metrics() -> dict[str, int | float]:
         "gpu_bytes": sum(int(item["gpu_bytes"]) for item in metrics),
         "hit_rate": hits / demand_accesses if demand_accesses > 0 else 0.0,
         "speculation_precision": (
-            useful_speculations / speculative_loads
-            if speculative_loads > 0
-            else 0.0
+            useful_speculations / speculative_loads if speculative_loads > 0 else 0.0
         ),
     }
 

@@ -383,6 +383,11 @@ class MiniMaxM2Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        from vllm.model_executor.layers.fused_moe.nvfp4_global_expert_cache import (
+            begin_global_nvfp4_expert_cache_step,
+        )
+
+        begin_global_nvfp4_expert_cache_step(input_ids, positions)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

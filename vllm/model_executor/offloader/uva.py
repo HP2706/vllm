@@ -17,6 +17,24 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
 
+UVA_OFFLOADED_PARAMETER_IDS: set[int] = set()
+
+
+def mark_uva_offloaded_parameter(parameter: nn.Parameter) -> None:
+    UVA_OFFLOADED_PARAMETER_IDS.add(id(parameter))
+
+
+def is_uva_offloaded_parameter(parameter: nn.Parameter) -> bool:
+    return id(parameter) in UVA_OFFLOADED_PARAMETER_IDS
+
+
+def replace_uva_offloaded_parameter(
+    original: nn.Parameter,
+    replacement: nn.Parameter,
+) -> None:
+    UVA_OFFLOADED_PARAMETER_IDS.discard(id(original))
+    UVA_OFFLOADED_PARAMETER_IDS.add(id(replacement))
+
 
 class UVAOffloader(BaseOffloader):
     """Offloader using Unified Virtual Addressing (UVA) for zero-copy access.
@@ -63,10 +81,14 @@ class UVAOffloader(BaseOffloader):
 
     def _maybe_offload_to_cpu(self, module: nn.Module) -> nn.Module:
         """Offload module parameters to CPU using UVA if budget allows."""
-        if (params := next(module.parameters(), None)) is None:
+        parameters = tuple(module.parameters())
+        if not parameters:
             return module
 
-        device = params.device
+        for parameter in parameters:
+            parameter._vllm_is_uva_offloaded = False
+
+        device = parameters[0].device
 
         if device == torch.device("cpu"):
             return module
@@ -103,6 +125,7 @@ class UVAOffloader(BaseOffloader):
             else:
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
                 p._vllm_is_uva_offloaded = True
+                mark_uva_offloaded_parameter(p)
 
             self.cpu_offload_bytes += p.data.numel() * p.data.element_size()
             offloaded_parameters = True

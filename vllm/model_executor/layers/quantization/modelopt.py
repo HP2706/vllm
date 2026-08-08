@@ -1666,19 +1666,43 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
+        expert_weights = layer.prepare_expert_weights(topk_ids)
+        quant_config = self.moe_kernel.fused_experts.quant_config
+        scale_values = (
+            expert_weights.w13_scale,
+            expert_weights.w2_scale,
+            expert_weights.w13_scale_2,
+            expert_weights.w2_scale_2,
+        )
+        if any(value is not None for value in scale_values):
+            if any(value is None for value in scale_values):
+                raise RuntimeError(
+                    "cached NVFP4 weights require all four scale tensors"
+                )
+            quant_config._w1.scale = expert_weights.w13_scale
+            quant_config._w2.scale = expert_weights.w2_scale
+            quant_config._w1.alpha_or_gscale = expert_weights.w13_scale_2
+            quant_config._w2.alpha_or_gscale = expert_weights.w2_scale_2
+        global_num_experts = (
+            layer.global_num_experts
+            if expert_weights.global_num_experts is None
+            else expert_weights.global_num_experts
+        )
+        output = self.moe_kernel.apply(
             x,
-            layer.w13_weight,
-            layer.w2_weight,
+            expert_weights.w13_weight,
+            expert_weights.w2_weight,
             topk_weights,
-            topk_ids,
+            expert_weights.topk_ids,
             activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
+            global_num_experts=global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+        layer.finish_expert_weights()
+        return output
 
 
 ModelOptNvFp4Config.LinearMethodCls = ModelOptNvFp4LinearMethod
@@ -1871,9 +1895,9 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             )
 
         # Validate weight scale tensor (should be 2D, not swizzled)
-        assert layer.weight_scale.ndim == 2, (
-            f"MXFP8 weight scale must be 2D, got {layer.weight_scale.ndim}D"
-        )
+        assert (
+            layer.weight_scale.ndim == 2
+        ), f"MXFP8 weight scale must be 2D, got {layer.weight_scale.ndim}D"
         assert layer.weight_scale.dtype == MXFP8_SCALE_DTYPE, (
             f"MXFP8 weight scale must be {MXFP8_SCALE_DTYPE},"
             f" got {layer.weight_scale.dtype}"
