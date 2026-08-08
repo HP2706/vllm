@@ -639,6 +639,13 @@ def initialize_global_nvfp4_expert_cache(
 ) -> None:
     global GLOBAL_NVFP4_EXPERT_CACHE
     if GLOBAL_NVFP4_EXPERT_CACHE is not None:
+        existing_layers = GLOBAL_NVFP4_EXPERT_CACHE.layers
+        if len(existing_layers) == len(layers) and all(
+            existing is requested
+            for existing, requested in zip(existing_layers, layers, strict=True)
+        ):
+            logger.info("Global NVFP4 expert cache is already linked to this model")
+            return
         raise RuntimeError("global NVFP4 expert cache was initialized twice")
     GLOBAL_NVFP4_EXPERT_CACHE = GlobalNVFP4ExpertCache(
         layers=layers,
