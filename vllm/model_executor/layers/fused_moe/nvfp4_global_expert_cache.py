@@ -494,10 +494,6 @@ class GlobalNVFP4ExpertCache:
                 w13_weight=source["w13_weight"],
                 w2_weight=source["w2_weight"],
                 topk_ids=topk_ids,
-                w13_scale=source["w13_weight_scale"],
-                w2_scale=source["w2_weight_scale"],
-                w13_scale_2=source["w13_weight_scale_2"],
-                w2_scale_2=source["w2_weight_scale_2"],
                 global_num_experts=self.num_experts,
             )
 
